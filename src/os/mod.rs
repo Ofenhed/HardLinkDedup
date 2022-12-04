@@ -1,6 +1,5 @@
 use async_trait::async_trait;
-use std::{io::Result as IoResult, path::PathBuf};
-use tokio::join;
+use std::{io::Result, path::PathBuf, hash::Hash};
 
 #[cfg(unix)]
 mod unix;
@@ -13,20 +12,22 @@ pub use self::windows::Storage;
 
 #[async_trait]
 trait FileBackend {
-  type StorageUid: Eq + Send;
-  type FileUid: Eq + Send;
-  async fn get_storage_uid(file: PathBuf) -> IoResult<Self::StorageUid>;
-  async fn get_file_uid(file: PathBuf) -> IoResult<Self::FileUid>;
-  async fn same_storage(file1: PathBuf, file2: PathBuf) -> std::io::Result<bool> {
-    let (file1_uid, file2_uid) = join!(Self::get_storage_uid(file1), Self::get_storage_uid(file2));
+  type StorageUid: Eq + Send + Hash;
+  type FileUid: Eq + Send + Hash;
+  type Metadata: Send;
+  async fn metadata(path: PathBuf) -> Result<Self::Metadata>;
+  fn get_storage_uid(file: &Self::Metadata) -> Result<Self::StorageUid>;
+  fn get_file_uid(file: &Self::Metadata) -> Result<Self::FileUid>;
+  fn same_storage(file1: &Self::Metadata, file2: &Self::Metadata) -> std::io::Result<bool> {
+    let (file1_uid, file2_uid) = (Self::get_storage_uid(&file1), Self::get_storage_uid(&file2));
     Ok(file1_uid? == file2_uid?)
   }
-  async fn same_file(file1: PathBuf, file2: PathBuf) -> std::io::Result<bool> {
-    let (file1_storage, file2_storage, file1_uid, file2_uid) = join!(
-      Self::get_storage_uid(file1.clone()),
-      Self::get_storage_uid(file2.clone()),
-      Self::get_file_uid(file1),
-      Self::get_file_uid(file2)
+  fn same_file(file1: &Self::Metadata, file2: &Self::Metadata) -> std::io::Result<bool> {
+    let (file1_storage, file2_storage, file1_uid, file2_uid) = (
+      Self::get_storage_uid(&file1),
+      Self::get_storage_uid(&file2),
+      Self::get_file_uid(&file1),
+      Self::get_file_uid(&file2),
     );
     Ok((file1_storage?, file1_uid?) == (file2_storage?, file2_uid?))
   }

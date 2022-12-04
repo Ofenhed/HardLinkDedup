@@ -1,6 +1,6 @@
 use super::FileBackend;
 use async_trait::async_trait;
-use std::{os::unix::fs::MetadataExt, path::PathBuf};
+use std::{fs::Metadata, io::Result, os::unix::fs::MetadataExt, path::PathBuf};
 use tokio::fs;
 
 pub struct Storage {}
@@ -11,11 +11,17 @@ impl FileBackend for Storage {
 
   type FileUid = u64;
 
-  async fn get_storage_uid(file: PathBuf) -> std::io::Result<Self::StorageUid> {
-    Ok(fs::metadata(file).await?.dev())
+  type Metadata = Metadata;
+
+  async fn metadata(path: PathBuf) -> Result<Self::Metadata> {
+    Ok(fs::metadata(path).await?)
   }
 
-  async fn get_file_uid(file: PathBuf) -> std::io::Result<Self::FileUid> {
-    Ok(fs::metadata(file).await?.ino())
+  fn get_storage_uid(metadata: &Self::Metadata) -> Result<Self::StorageUid> {
+    Ok(metadata.dev())
+  }
+
+  fn get_file_uid(metadata: &Self::Metadata) -> Result<Self::FileUid> {
+    Ok(metadata.ino())
   }
 }

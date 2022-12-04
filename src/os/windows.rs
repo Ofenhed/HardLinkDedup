@@ -19,12 +19,18 @@ enum FileHandle {
   Path(PathBuf),
 }
 
-impl Storage {
-  fn get_file_info(file: FileHandle) -> Result<BY_HANDLE_FILE_INFORMATION> {
-    let file = match file {
-      FileHandle::File(f) => f,
-      FileHandle::Path(path) => File::open(path)?,
-    };
+impl Storage {}
+
+#[async_trait]
+impl FileBackend for Storage {
+  type StorageUid = u32;
+
+  type FileUid = u64;
+
+  type Metadata = BY_HANDLE_FILE_INFORMATION;
+
+  async fn metadata(path: PathBuf) -> Result<Self::Metadata> {
+    let file = File::open(path)?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     let info_ptr: *mut BY_HANDLE_FILE_INFORMATION = &mut info;
     let handle = HANDLE(unsafe { *(file.as_raw_handle() as *const isize) });
@@ -34,21 +40,12 @@ impl Storage {
       return Err(Error::last_os_error())?;
     }
   }
-}
 
-#[async_trait]
-impl FileBackend for Storage {
-  type StorageUid = u32;
-
-  type FileUid = u64;
-
-  async fn get_storage_uid(file: PathBuf) -> Result<Self::StorageUid> {
-    let info = Storage::get_file_info(FileHandle::Path(file))?;
+  fn get_storage_uid(info: &Self::Metadata) -> Result<Self::StorageUid> {
     Ok(info.dwVolumeSerialNumber)
   }
 
-  async fn get_file_uid(file: PathBuf) -> Result<Self::FileUid> {
-    let info = Storage::get_file_info(FileHandle::Path(file))?;
+  fn get_file_uid(info: &Self::Metadata) -> Result<Self::FileUid> {
     Ok((info.nFileIndexHigh as Self::FileUid) << 32 | (info.nFileIndexLow as Self::FileUid))
   }
 }
