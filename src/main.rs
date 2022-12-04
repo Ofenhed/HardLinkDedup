@@ -188,7 +188,15 @@ async fn scan_dir(dir: PathBuf, entry_found_tx: mpsc::Sender<NewDataHolder>) -> 
 
 async fn merge_with_hard_link(file1: impl AsRef<Path>, file2: impl AsRef<Path>) -> Result<()> {
   let args = Lazy::force(&ARGS);
-  let new_file = file2.as_ref().with_extension(&args.temporary_extension);
+  let new_file = if let Some(new_file_name) = file2.as_ref().file_name() {
+    let mut new_file_name = new_file_name.to_owned();
+    new_file_name.push(".");
+    new_file_name.push(&args.temporary_extension);
+    file2.as_ref().with_file_name(new_file_name)
+  } else {
+    unreachable!()
+  };
+
   if args.dry_run {
     println!(
       "Creating file {} linked with {}",
