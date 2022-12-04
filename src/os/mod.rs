@@ -17,6 +17,10 @@ trait FileBackend {
   type FileUid: Eq + Send;
   async fn get_storage_uid(file: PathBuf) -> IoResult<Self::StorageUid>;
   async fn get_file_uid(file: PathBuf) -> IoResult<Self::FileUid>;
+  async fn same_storage(file1: PathBuf, file2: PathBuf) -> std::io::Result<bool> {
+    let (file1_uid, file2_uid) = join!(Self::get_storage_uid(file1), Self::get_storage_uid(file2));
+    Ok(file1_uid? == file2_uid?)
+  }
   async fn same_file(file1: PathBuf, file2: PathBuf) -> std::io::Result<bool> {
     let (file1_storage, file2_storage, file1_uid, file2_uid) = join!(
       Self::get_storage_uid(file1.clone()),
@@ -24,7 +28,6 @@ trait FileBackend {
       Self::get_file_uid(file1),
       Self::get_file_uid(file2)
     );
-    let (file1, file2) = ((file1_storage?, file1_uid?), (file2_storage?, file2_uid?));
-    Ok(file1 == file2)
+    Ok((file1_storage?, file1_uid?) == (file2_storage?, file2_uid?))
   }
 }
