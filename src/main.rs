@@ -196,13 +196,11 @@ async fn main() {
     }
   });
 
-  let mut unique_files = HashMap::<UniqueFileId, Vec<PathBuf>>::new();
-  let mut file_ids = HashMap::<PathBuf, FileId>::new();
+  let mut unique_files = HashMap::<UniqueFileId, Vec<(PathBuf, FileId)>>::new();
   let mut wasted_space: Filesize = 0;
 
   while let Some(file_info) = new_file_hash_rx.recv().await {
     let identifier = file_info.get_identifier();
-    file_ids.insert(file_info.path.clone(), file_info.file_id);
     match unique_files.get_mut(&identifier) {
       Some(ref mut same_files) => {
         println!(
@@ -211,11 +209,10 @@ async fn main() {
           same_files
         );
         wasted_space += file_info.size;
-        same_files.push(file_info.path);
+        same_files.push((file_info.path, file_info.file_id));
       }
       None => {
-        unique_files.insert(identifier, vec![file_info.path]);
-        println!("storage: {}", file_info.storage_uid);
+        unique_files.insert(identifier, vec![(file_info.path, file_info.file_id)]);
       }
     }
   }
