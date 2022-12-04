@@ -205,7 +205,10 @@ async fn merge_with_hard_link(file1: impl AsRef<Path>, file2: impl AsRef<Path>) 
       file2.as_ref().display()
     );
   } else {
-    fs::rename(new_file, &file2).await?;
+    if let Err(e) = fs::rename(&new_file, &file2).await {
+      fs::remove_file(new_file).await?;
+      return Err(e)?;
+    }
   }
   if !args.not_readonly {
     if args.dry_run {
