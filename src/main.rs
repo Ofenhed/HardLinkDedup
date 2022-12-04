@@ -34,13 +34,22 @@ struct FileWithMetadata {
   size: Filesize,
 }
 
+type UniqueFileId = (StorageUid, Filesize, HashDigest);
+
 #[derive(Debug)]
-struct HashedFile {
-  file: FileWithMetadata,
+struct FileContentInfo {
+  path: PathBuf,
+  size: Filesize,
   hash: HashDigest,
+  storage_uid: StorageUid,
+  file_id: FileId,
 }
 
-type FileIdentifier = (Filesize, HashDigest);
+impl FileContentInfo {
+  fn get_identifier(&self) -> UniqueFileId {
+    (self.storage_uid, self.size, self.hash)
+  }
+}
 
 #[derive(Debug)]
 enum NewData {
@@ -97,7 +106,7 @@ async fn scan_dir(what: ScanDirJob) -> Result<()> {
 
 async fn calculate_file_hash(
   file: impl AsRef<Path>,
-  hash_calculated_tx: mpsc::Sender<(FileIdentifier, PathBuf)>,
+  hash_calculated_tx: mpsc::Sender<FileContentInfo>,
 ) -> Result<()> {
   let mut read_buf = vec![0; 16 * 1024];
   let mut reader = fs::File::open(&file).await?;
@@ -111,13 +120,21 @@ async fn calculate_file_hash(
     }
     hash.update(&read_buf[..bytes_read]);
   }
-  hash_calculated_tx
-    .send((
-      (file_length.try_into().unwrap(), hash.digest128()),
-      file.as_ref().to_path_buf(),
-    ))
-    .await
-    .unwrap();
+  let link_metadata = match reader.link_metadata().await {
+      Ok(x) => Ok(x),
+      Err(e) => {
+        println!("Error: {}", e);
+        Err(e)
+      }
+  }?;
+  let file_info = FileContentInfo {
+    path: file.as_ref().to_path_buf(),
+    size: file_length.try_into().unwrap(),
+    hash: hash.digest128(),
+    storage_uid: link_metadata.get_storage_uid(),
+    file_id: link_metadata.get_file_id(),
+  };
+  hash_calculated_tx.send(file_info).await.unwrap();
   Ok(())
 }
 
@@ -130,7 +147,7 @@ enum FilesizeStatus {
 async fn main() {
   let args = Lazy::force(&ARGS);
   let (file_found_tx, mut file_found_rx) = mpsc::channel::<NewData>(max(100, args.path.len()));
-  let (new_file_hash_tx, mut new_file_hash_rx) = mpsc::channel::<(FileIdentifier, PathBuf)>(10);
+  let (new_file_hash_tx, mut new_file_hash_rx) = mpsc::channel::<FileContentInfo>(10);
 
   spawn(async move {
     for path in &args.path {
@@ -179,18 +196,26 @@ async fn main() {
     }
   });
 
-  let mut unique_files = HashMap::<FileIdentifier, Vec<PathBuf>>::new();
+  let mut unique_files = HashMap::<UniqueFileId, Vec<PathBuf>>::new();
+  let mut file_ids = HashMap::<PathBuf, FileId>::new();
   let mut wasted_space: Filesize = 0;
 
-  while let Some((identifier, path)) = new_file_hash_rx.recv().await {
+  while let Some(file_info) = new_file_hash_rx.recv().await {
+    let identifier = file_info.get_identifier();
+    file_ids.insert(file_info.path.clone(), file_info.file_id);
     match unique_files.get_mut(&identifier) {
       Some(ref mut same_files) => {
-        println!("The file {} is a duplicate", path.display());
-        wasted_space += identifier.0;
-        same_files.push(path);
+        println!(
+          "The file {} is a duplicate to {:?}",
+          file_info.path.display(),
+          same_files
+        );
+        wasted_space += file_info.size;
+        same_files.push(file_info.path);
       }
       None => {
-        unique_files.insert(identifier, vec![path]);
+        unique_files.insert(identifier, vec![file_info.path]);
+        println!("storage: {}", file_info.storage_uid);
       }
     }
   }
