@@ -32,8 +32,6 @@ struct DedupArgs {
 struct FileWithMetadata {
   path: PathBuf,
   size: Filesize,
-  storage_uid: StorageUid,
-  file_id: FileId,
 }
 
 #[derive(Debug)]
@@ -86,17 +84,9 @@ async fn scan_dir(what: ScanDirJob) -> Result<()> {
       }
       let size = metadata.len();
       let path = entry.path();
-      let link_metadata = path.link_metadata().await?;
-      let storage_uid = link_metadata.get_storage_uid();
-      let file_id = link_metadata.get_file_id();
       if size > 0 {
         file_found_tx
-          .send(NewData::File(FileWithMetadata {
-            path,
-            size,
-            storage_uid,
-            file_id,
-          }))
+          .send(NewData::File(FileWithMetadata { path, size }))
           .await
           .unwrap();
       }
