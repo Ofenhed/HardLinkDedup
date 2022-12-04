@@ -315,9 +315,10 @@ async fn main() {
         if similar_file_id == &file_info.file_id {
           continue;
         }
-        wasted_space += file_info.size;
         match merge_with_hard_link(&similar_file_path, &file_info.path).await {
-          Ok(()) => {}
+          Ok(()) => {
+            wasted_space += file_info.size;
+          }
           Err(e) => eprintln!(
             "Failed to merge {} with {}: {}",
             similar_file_path.display(),
