@@ -5,7 +5,7 @@ use std::{
   cmp::max,
   collections::HashMap,
   ffi::OsString,
-  io::Result,
+  io::{Error, ErrorKind, Result},
   path::{Path, PathBuf},
 };
 use tokio::{fs, io::AsyncReadExt, spawn, sync::mpsc};
@@ -49,51 +49,115 @@ struct FileWithMetadata {
   size: Filesize,
 }
 
-type UniqueFileId = (StorageUid, Filesize, HashDigest);
+#[derive(Debug)]
+enum HashValue {
+  Incomplete(fs::File),
+  Hash(HashDigest),
+}
 
 #[derive(Debug)]
 struct FileContentInfo {
   path: PathBuf,
   size: Filesize,
-  hash: HashDigest,
+  hash: HashValue,
   storage_uid: StorageUid,
   file_id: FileId,
-}
-
-impl FileContentInfo {
-  fn get_identifier(&self) -> UniqueFileId {
-    (self.storage_uid, self.size, self.hash)
-  }
 }
 
 #[derive(Debug)]
 enum NewData {
   File(FileWithMetadata),
-  Dir(ScanDirJob),
+  FileContentInfo(FileContentInfo),
+  Dir(PathBuf),
+}
+
+#[derive(Debug)]
+struct NewDataHolder {
+  data: NewData,
+  sender: mpsc::Sender<NewDataHolder>,
 }
 
 static ARGS: Lazy<DedupArgs> = Lazy::new(|| DedupArgs::parse());
 
-#[derive(Debug)]
-struct ScanDirJob {
-  dir: PathBuf,
-  file_found_tx: mpsc::Sender<NewData>,
+impl FileContentInfo {
+  async fn create(
+    path: impl AsRef<Path>,
+    file_metadata_found: mpsc::Sender<NewDataHolder>,
+  ) -> Result<()> {
+    let reader = fs::File::open(&path).await?;
+    let link_metadata = match reader.link_metadata().await {
+      Ok(x) => Ok(x),
+      Err(e) => {
+        println!("Error: {}", e);
+        Err(e)
+      }
+    }?;
+    let file_info = FileContentInfo {
+      path: path.as_ref().to_path_buf(),
+      size: reader.metadata().await?.len().try_into().unwrap(),
+      hash: HashValue::Incomplete(reader),
+      storage_uid: link_metadata.get_storage_uid(),
+      file_id: link_metadata.get_file_id(),
+    };
+    file_metadata_found
+      .send(NewDataHolder {
+        data: NewData::FileContentInfo(file_info),
+        sender: file_metadata_found.clone(),
+      })
+      .await
+      .unwrap();
+    Ok(())
+  }
+
+  async fn calculate_file_hash(self, file_hash_found: mpsc::Sender<NewDataHolder>) -> Result<()> {
+    if let HashValue::Incomplete(mut reader) = self.hash {
+      let mut read_buf = vec![0; 16 * 1024];
+      let mut hash = Xxh3::new();
+      let mut file_length = 0;
+      loop {
+        let bytes_read = reader.read(&mut read_buf[..]).await?;
+        file_length += bytes_read;
+        if bytes_read == 0 {
+          break;
+        }
+        hash.update(&read_buf[..bytes_read]);
+      }
+      if file_length != self.size as usize {
+        return Err(Error::new(
+          ErrorKind::BrokenPipe,
+          format!(
+            "The entire file {} could not be hashed",
+            self.path.display()
+          ),
+        ))?;
+      }
+      file_hash_found
+        .send(NewDataHolder {
+          data: NewData::FileContentInfo(Self {
+            hash: HashValue::Hash(hash.digest128()),
+            ..self
+          }),
+          sender: file_hash_found.clone(),
+        })
+        .await
+        .unwrap();
+    }
+    Ok(())
+  }
 }
 
-async fn scan_dir(what: ScanDirJob) -> Result<()> {
-  let ScanDirJob {
-    ref dir,
-    ref file_found_tx,
-  } = what;
+async fn scan_dir(dir: PathBuf, entry_found_tx: mpsc::Sender<NewDataHolder>) -> Result<()> {
   let mut reader = fs::read_dir(dir).await?;
   while let Some(entry) = reader.next_entry().await? {
     let metadata = entry.metadata().await?;
     if metadata.is_dir() {
-      let job = ScanDirJob {
-        dir: entry.path(),
-        file_found_tx: file_found_tx.clone(),
-      };
-      file_found_tx.send(NewData::Dir(job)).await.unwrap();
+      entry_found_tx
+        .send(NewDataHolder {
+          data: NewData::Dir(entry.path()),
+          sender: entry_found_tx.clone(),
+        })
+        .await
+        .unwrap();
     } else if metadata.is_file() {
       if let Some(ref pattern) = Lazy::force(&ARGS).pattern {
         if let Some(file_name) = entry.path().file_name().map(|name| name.to_string_lossy()) {
@@ -109,47 +173,16 @@ async fn scan_dir(what: ScanDirJob) -> Result<()> {
       let size = metadata.len();
       let path = entry.path();
       if size > 0 {
-        file_found_tx
-          .send(NewData::File(FileWithMetadata { path, size }))
+        entry_found_tx
+          .send(NewDataHolder {
+            data: NewData::File(FileWithMetadata { path, size }),
+            sender: entry_found_tx.clone(),
+          })
           .await
           .unwrap();
       }
     }
   }
-  Ok(())
-}
-
-async fn calculate_file_hash(
-  file: impl AsRef<Path>,
-  hash_calculated_tx: mpsc::Sender<FileContentInfo>,
-) -> Result<()> {
-  let mut read_buf = vec![0; 16 * 1024];
-  let mut reader = fs::File::open(&file).await?;
-  let mut hash = Xxh3::new();
-  let mut file_length = 0;
-  loop {
-    let bytes_read = reader.read(&mut read_buf[..]).await?;
-    file_length += bytes_read;
-    if bytes_read == 0 {
-      break;
-    }
-    hash.update(&read_buf[..bytes_read]);
-  }
-  let link_metadata = match reader.link_metadata().await {
-    Ok(x) => Ok(x),
-    Err(e) => {
-      println!("Error: {}", e);
-      Err(e)
-    }
-  }?;
-  let file_info = FileContentInfo {
-    path: file.as_ref().to_path_buf(),
-    size: file_length.try_into().unwrap(),
-    hash: hash.digest128(),
-    storage_uid: link_metadata.get_storage_uid(),
-    file_id: link_metadata.get_file_id(),
-  };
-  hash_calculated_tx.send(file_info).await.unwrap();
   Ok(())
 }
 
@@ -198,61 +231,85 @@ enum FilesizeStatus {
 #[tokio::main]
 async fn main() {
   let args = Lazy::force(&ARGS);
-  let (file_found_tx, mut file_found_rx) = mpsc::channel::<NewData>(max(100, args.path.len()));
-  let (new_file_hash_tx, mut new_file_hash_rx) = mpsc::channel::<FileContentInfo>(10);
+  let (file_found_tx, mut file_found_rx) =
+    mpsc::channel::<NewDataHolder>(max(100, args.path.len()));
+  let (new_file_data_tx, mut new_file_data_rx) = mpsc::channel::<FileContentInfo>(10);
 
   spawn(async move {
     for path in &args.path {
-      let job = ScanDirJob {
-        dir: path.to_owned(),
-        file_found_tx: file_found_tx.clone(),
-      };
-      spawn(scan_dir(job));
+      spawn(scan_dir(path.to_owned(), file_found_tx.clone()));
     }
     drop(file_found_tx);
     let mut found_files = HashMap::<Filesize, FilesizeStatus>::new();
+    let mut file_id_hashes = HashMap::<(StorageUid, FileId), HashDigest>::new();
     while let Some(new_data) = file_found_rx.recv().await {
       match new_data {
-        NewData::File(new_file) => {
-          match found_files.insert(new_file.size, FilesizeStatus::FoundOne(new_file.path)) {
-            None => (),
-            Some(FilesizeStatus::FoundOne(other_file)) => {
-              spawn(calculate_file_hash(other_file, new_file_hash_tx.clone()));
-              let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
-                .insert(new_file.size, FilesizeStatus::FoundMultiple)
-                .unwrap()
-              {
-                new_file
-              } else {
-                unreachable!()
-              };
-              spawn(calculate_file_hash(new_file, new_file_hash_tx.clone()));
+        NewDataHolder {
+          data: NewData::File(new_file),
+          sender,
+        } => match found_files.insert(new_file.size, FilesizeStatus::FoundOne(new_file.path)) {
+          None => (),
+          Some(FilesizeStatus::FoundOne(other_file)) => {
+            spawn(FileContentInfo::create(other_file, sender.clone()));
+            let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
+              .insert(new_file.size, FilesizeStatus::FoundMultiple)
+              .unwrap()
+            {
+              new_file
+            } else {
+              unreachable!()
+            };
+            spawn(FileContentInfo::create(new_file, sender.clone()));
+          }
+          Some(FilesizeStatus::FoundMultiple) => {
+            let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
+              .insert(new_file.size, FilesizeStatus::FoundMultiple)
+              .unwrap()
+            {
+              new_file
+            } else {
+              unreachable!()
+            };
+            spawn(FileContentInfo::create(new_file, sender.clone()));
+          }
+        },
+        NewDataHolder {
+          data: NewData::FileContentInfo(file_info),
+          sender,
+        } => {
+          let hash_identifier = (file_info.storage_uid, file_info.file_id);
+          match file_info.hash {
+            HashValue::Incomplete(..) => {
+              if file_id_hashes.get(&hash_identifier).is_none() {
+                spawn(file_info.calculate_file_hash(sender));
+              }
             }
-            Some(FilesizeStatus::FoundMultiple) => {
-              let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
-                .insert(new_file.size, FilesizeStatus::FoundMultiple)
-                .unwrap()
-              {
-                new_file
-              } else {
-                unreachable!()
-              };
-              spawn(calculate_file_hash(new_file, new_file_hash_tx.clone()));
+            HashValue::Hash(hash_digest) => {
+              file_id_hashes.insert(hash_identifier, hash_digest);
+              new_file_data_tx.send(file_info).await.unwrap()
             }
           }
         }
-        NewData::Dir(job) => {
-          spawn(scan_dir(job));
+        NewDataHolder {
+          data: NewData::Dir(dir),
+          sender,
+        } => {
+          spawn(scan_dir(dir, sender));
         }
       }
     }
   });
 
-  let mut unique_files = HashMap::<UniqueFileId, (PathBuf, FileId)>::new();
+  let mut unique_files = HashMap::<(StorageUid, Filesize, HashDigest), (PathBuf, FileId)>::new();
   let mut wasted_space: Filesize = 0;
 
-  while let Some(file_info) = new_file_hash_rx.recv().await {
-    let identifier = file_info.get_identifier();
+  while let Some(file_info) = new_file_data_rx.recv().await {
+    let hash_digest = if let HashValue::Hash(hash_digest) = file_info.hash {
+      hash_digest
+    } else {
+      unreachable!()
+    };
+    let identifier = (file_info.storage_uid, file_info.size, hash_digest);
     match unique_files.get_mut(&identifier) {
       Some((ref similar_file_path, ref similar_file_id)) => {
         if similar_file_id == &file_info.file_id {
@@ -272,11 +329,12 @@ async fn main() {
       None => {
         unique_files.insert(identifier, (file_info.path, file_info.file_id));
       }
-    }
+    };
   }
 
   println!(
-    "A total of {} MiB can be saved",
-    wasted_space / (1024 * 1024)
+    "A total of {} MiB {} saved",
+    wasted_space / (1024 * 1024),
+    if args.dry_run { "can be" } else { "was" }
   );
 }
