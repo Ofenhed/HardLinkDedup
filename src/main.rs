@@ -16,6 +16,8 @@ use tokio::{
 };
 use xxhash_rust::xxh3::Xxh3;
 
+mod os;
+
 type HashDigest = u128;
 type Filesize = u64;
 
