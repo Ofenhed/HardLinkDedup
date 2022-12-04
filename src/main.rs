@@ -1,9 +1,10 @@
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
   cmp::max,
   collections::HashMap,
+  ffi::OsString,
   io::Result,
   path::{Path, PathBuf},
 };
@@ -22,6 +23,20 @@ struct DedupArgs {
   /// Regex pattern files must match to be included in the dedup.
   #[arg(short, long)]
   pattern: Option<Regex>,
+
+  /// Don't actually do anything, just print what would have been done.
+  #[arg(short, long, action = ArgAction::SetTrue)]
+  dry_run: bool,
+
+  /// The extension to apply to the hard link before it's renamed to the original filename.
+  #[arg(short, long, default_value = "hard_link")]
+  temporary_extension: OsString,
+
+  /// By default, all hardlinked files will be set readonly (to avoid confusing file interactions).
+  /// This flags makes it so that this program doesn't affect file permissions beyond the effect of
+  /// hard linking the files.
+  #[arg(short, long, action = ArgAction::SetTrue)]
+  not_readonly: bool,
 
   /// Paths where files will be deduplicated.
   #[arg(required = true, value_hint = clap::ValueHint::DirPath)]
@@ -121,11 +136,11 @@ async fn calculate_file_hash(
     hash.update(&read_buf[..bytes_read]);
   }
   let link_metadata = match reader.link_metadata().await {
-      Ok(x) => Ok(x),
-      Err(e) => {
-        println!("Error: {}", e);
-        Err(e)
-      }
+    Ok(x) => Ok(x),
+    Err(e) => {
+      println!("Error: {}", e);
+      Err(e)
+    }
   }?;
   let file_info = FileContentInfo {
     path: file.as_ref().to_path_buf(),
@@ -135,6 +150,43 @@ async fn calculate_file_hash(
     file_id: link_metadata.get_file_id(),
   };
   hash_calculated_tx.send(file_info).await.unwrap();
+  Ok(())
+}
+
+async fn merge_with_hard_link(file1: impl AsRef<Path>, file2: impl AsRef<Path>) -> Result<()> {
+  let args = Lazy::force(&ARGS);
+  let new_file = file2.as_ref().with_extension(&args.temporary_extension);
+  if args.dry_run {
+    println!(
+      "Creating file {} linked with {}",
+      new_file.display(),
+      file1.as_ref().display()
+    );
+  } else {
+    fs::hard_link(&file1, &new_file).await?;
+  }
+  if args.dry_run {
+    println!(
+      "Renaming file {} to {}",
+      new_file.display(),
+      file2.as_ref().display()
+    );
+  } else {
+    fs::rename(new_file, &file2).await?;
+  }
+  if !args.not_readonly {
+    if args.dry_run {
+      if !fs::metadata(&file1).await?.permissions().readonly() {
+        println!("Applying readonly to {} ", file1.as_ref().display());
+      }
+    } else {
+      let mut permissions = fs::metadata(&file1).await?.permissions();
+      if !permissions.readonly() {
+        permissions.set_readonly(true);
+        fs::set_permissions(&file1, permissions).await?;
+      }
+    }
+  }
   Ok(())
 }
 
@@ -196,23 +248,29 @@ async fn main() {
     }
   });
 
-  let mut unique_files = HashMap::<UniqueFileId, Vec<(PathBuf, FileId)>>::new();
+  let mut unique_files = HashMap::<UniqueFileId, (PathBuf, FileId)>::new();
   let mut wasted_space: Filesize = 0;
 
   while let Some(file_info) = new_file_hash_rx.recv().await {
     let identifier = file_info.get_identifier();
     match unique_files.get_mut(&identifier) {
-      Some(ref mut same_files) => {
-        println!(
-          "The file {} is a duplicate to {:?}",
-          file_info.path.display(),
-          same_files
-        );
+      Some((ref similar_file_path, ref similar_file_id)) => {
+        if similar_file_id == &file_info.file_id {
+          continue;
+        }
         wasted_space += file_info.size;
-        same_files.push((file_info.path, file_info.file_id));
+        match merge_with_hard_link(&similar_file_path, &file_info.path).await {
+          Ok(()) => {}
+          Err(e) => eprintln!(
+            "Failed to merge {} with {}: {}",
+            similar_file_path.display(),
+            file_info.path.display(),
+            e
+          ),
+        }
       }
       None => {
-        unique_files.insert(identifier, vec![(file_info.path, file_info.file_id)]);
+        unique_files.insert(identifier, (file_info.path, file_info.file_id));
       }
     }
   }
