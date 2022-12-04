@@ -7,16 +7,11 @@ use std::{
   io::Result,
   path::{Path, PathBuf},
 };
-use tokio::{
-  fs,
-  io::{AsyncReadExt, ReadBuf},
-  join, spawn,
-  sync::{mpsc, oneshot},
-  task::JoinSet,
-};
+use tokio::{fs, io::AsyncReadExt, spawn, sync::mpsc};
 use xxhash_rust::xxh3::Xxh3;
 
 mod os;
+use os::{FileBackend, FileId, FileLinkBackend, StorageUid};
 
 type HashDigest = u128;
 type Filesize = u64;
@@ -34,14 +29,16 @@ struct DedupArgs {
 }
 
 #[derive(Debug)]
-struct SizedFile {
+struct FileWithMetadata {
   path: PathBuf,
   size: Filesize,
+  storage_uid: StorageUid,
+  file_id: FileId,
 }
 
 #[derive(Debug)]
 struct HashedFile {
-  file: SizedFile,
+  file: FileWithMetadata,
   hash: HashDigest,
 }
 
@@ -49,7 +46,7 @@ type FileIdentifier = (Filesize, HashDigest);
 
 #[derive(Debug)]
 enum NewData {
-  File(SizedFile),
+  File(FileWithMetadata),
   Dir(ScanDirJob),
 }
 
@@ -89,9 +86,17 @@ async fn scan_dir(what: ScanDirJob) -> Result<()> {
       }
       let size = metadata.len();
       let path = entry.path();
+      let link_metadata = path.link_metadata().await?;
+      let storage_uid = link_metadata.get_storage_uid();
+      let file_id = link_metadata.get_file_id();
       if size > 0 {
         file_found_tx
-          .send(NewData::File(SizedFile { path, size }))
+          .send(NewData::File(FileWithMetadata {
+            path,
+            size,
+            storage_uid,
+            file_id,
+          }))
           .await
           .unwrap();
       }
@@ -146,7 +151,7 @@ async fn main() {
       spawn(scan_dir(job));
     }
     drop(file_found_tx);
-    let mut found_files = HashMap::<u64, FilesizeStatus>::new();
+    let mut found_files = HashMap::<Filesize, FilesizeStatus>::new();
     while let Some(new_data) = file_found_rx.recv().await {
       match new_data {
         NewData::File(new_file) => {

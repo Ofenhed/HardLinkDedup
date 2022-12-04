@@ -1,4 +1,4 @@
-use super::FileBackend;
+use super::{FileBackend, FileLinkBackend};
 use async_trait::async_trait;
 use std::{
   fs::File,
@@ -12,40 +12,52 @@ use windows::Win32::{
   Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
 };
 
-pub struct Storage {}
-
-enum FileHandle {
-  File(File),
-  Path(PathBuf),
-}
-
-impl Storage {}
-
 #[async_trait]
-impl FileBackend for Storage {
-  type StorageUid = u32;
-
-  type FileUid = u64;
-
+impl FileBackend for File {
   type Metadata = BY_HANDLE_FILE_INFORMATION;
 
-  async fn metadata(path: PathBuf) -> Result<Self::Metadata> {
-    let file = File::open(path)?;
+  async fn link_metadata(&self) -> Result<Self::Metadata> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     let info_ptr: *mut BY_HANDLE_FILE_INFORMATION = &mut info;
-    let handle = HANDLE(unsafe { *(file.as_raw_handle() as *const isize) });
+    let handle = HANDLE(unsafe { *(self.as_raw_handle() as *const isize) });
     if unsafe { GetFileInformationByHandle(handle, info_ptr).as_bool() } {
       Ok(info)
     } else {
       return Err(Error::last_os_error())?;
     }
   }
+}
 
-  fn get_storage_uid(info: &Self::Metadata) -> Result<Self::StorageUid> {
-    Ok(info.dwVolumeSerialNumber)
+#[async_trait]
+impl FileBackend for fs::File {
+  type Metadata = BY_HANDLE_FILE_INFORMATION;
+
+  async fn link_metadata(&self) -> Result<Self::Metadata> {
+    let new_file = self.try_clone().await?;
+    Ok(new_file.link_metadata().await?)
+  }
+}
+
+#[async_trait]
+impl FileBackend for PathBuf {
+  type Metadata = BY_HANDLE_FILE_INFORMATION;
+
+  async fn link_metadata(&self) -> Result<Self::Metadata> {
+    let file = File::open(self)?;
+    Ok(file.link_metadata().await?)
+  }
+}
+
+impl FileLinkBackend for BY_HANDLE_FILE_INFORMATION {
+  type StorageUid = u32;
+
+  type FileId = u64;
+
+  fn get_storage_uid(&self) -> Self::StorageUid {
+    self.dwVolumeSerialNumber
   }
 
-  fn get_file_uid(info: &Self::Metadata) -> Result<Self::FileUid> {
-    Ok((info.nFileIndexHigh as Self::FileUid) << 32 | (info.nFileIndexLow as Self::FileUid))
+  fn get_file_id(&self) -> Self::FileId {
+    (self.nFileIndexHigh as u64) << 32 | (self.nFileIndexLow as u64)
   }
 }

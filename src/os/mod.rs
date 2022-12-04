@@ -1,34 +1,40 @@
 use async_trait::async_trait;
-use std::{io::Result, path::PathBuf, hash::Hash};
+use std::{fs::File, hash::Hash, io::Result};
 
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::Storage;
+pub use unix::*;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use self::windows::Storage;
+pub use self::windows::*;
 
-#[async_trait]
-trait FileBackend {
+pub trait FileLinkBackend {
   type StorageUid: Eq + Send + Hash;
-  type FileUid: Eq + Send + Hash;
-  type Metadata: Send;
-  async fn metadata(path: PathBuf) -> Result<Self::Metadata>;
-  fn get_storage_uid(file: &Self::Metadata) -> Result<Self::StorageUid>;
-  fn get_file_uid(file: &Self::Metadata) -> Result<Self::FileUid>;
-  fn same_storage(file1: &Self::Metadata, file2: &Self::Metadata) -> std::io::Result<bool> {
-    let (file1_uid, file2_uid) = (Self::get_storage_uid(&file1), Self::get_storage_uid(&file2));
-    Ok(file1_uid? == file2_uid?)
+  type FileId: Eq + Send + Hash;
+  fn get_storage_uid(&self) -> Self::StorageUid;
+  fn get_file_id(&self) -> Self::FileId;
+  fn same_storage(&self, other: &Self) -> bool {
+    let (file1_uid, file2_uid) = (self.get_storage_uid(), other.get_storage_uid());
+    file1_uid == file2_uid
   }
-  fn same_file(file1: &Self::Metadata, file2: &Self::Metadata) -> std::io::Result<bool> {
+  fn same_file(&self, other: &Self) -> bool {
     let (file1_storage, file2_storage, file1_uid, file2_uid) = (
-      Self::get_storage_uid(&file1),
-      Self::get_storage_uid(&file2),
-      Self::get_file_uid(&file1),
-      Self::get_file_uid(&file2),
+      self.get_storage_uid(),
+      other.get_storage_uid(),
+      self.get_file_id(),
+      other.get_file_id(),
     );
-    Ok((file1_storage?, file1_uid?) == (file2_storage?, file2_uid?))
+    (file1_storage, file1_uid) == (file2_storage, file2_uid)
   }
 }
+
+#[async_trait]
+pub trait FileBackend {
+  type Metadata: FileLinkBackend + Send;
+  async fn link_metadata(&self) -> Result<Self::Metadata>;
+}
+
+pub type StorageUid = <<File as FileBackend>::Metadata as FileLinkBackend>::StorageUid;
+pub type FileId = <<File as FileBackend>::Metadata as FileLinkBackend>::FileId;
