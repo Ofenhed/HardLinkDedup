@@ -3,12 +3,12 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
   cmp::max,
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   ffi::OsString,
   io::{Error, ErrorKind, Result},
   path::{Path, PathBuf},
 };
-use tokio::{fs, io::AsyncReadExt, spawn, sync::mpsc};
+use tokio::{fs, io::AsyncReadExt, join, spawn, sync::mpsc};
 use xxhash_rust::xxh3::Xxh3;
 
 mod os;
@@ -28,6 +28,10 @@ struct DedupArgs {
   #[arg(short, long, action = ArgAction::SetTrue)]
   dry_run: bool,
 
+  /// File buffer size per file in KiB.
+  #[arg(short, long, default_value = "16")]
+  buffer_size: usize,
+
   /// The extension to apply to the hard link before it's renamed to the original filename.
   #[arg(short, long, default_value = "hard_link")]
   temporary_extension: OsString,
@@ -38,36 +42,41 @@ struct DedupArgs {
   #[arg(short, long, action = ArgAction::SetTrue)]
   not_readonly: bool,
 
+  /// Fully compare files before overwriting. This is a lot more expensive than checking hashes,
+  /// which is the default behaviour.
+  #[arg(short = 'f', long, action = ArgAction::SetTrue)]
+  paranoid: bool,
+
   /// Paths where files will be deduplicated.
   #[arg(required = true, value_hint = clap::ValueHint::DirPath)]
   path: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
-struct FileWithMetadata {
+struct SizedFile {
   path: PathBuf,
   size: Filesize,
 }
 
 #[derive(Debug)]
-enum HashValue {
-  Incomplete(fs::File),
-  Hash(HashDigest),
-}
-
-#[derive(Debug)]
-struct FileContentInfo {
+struct FileStorageData {
   path: PathBuf,
   size: Filesize,
-  hash: HashValue,
   storage_uid: StorageUid,
   file_id: FileId,
 }
 
+impl FileStorageData {
+  fn unique_id(&self) -> (StorageUid, FileId) {
+    (self.storage_uid, self.file_id)
+  }
+}
+
 #[derive(Debug)]
 enum NewData {
-  File(FileWithMetadata),
-  FileContentInfo(FileContentInfo),
+  File(SizedFile),
+  OpenFile(FileStorageData, fs::File),
+  HashedFile(FileStorageData, HashDigest),
   Dir(PathBuf),
 }
 
@@ -79,8 +88,8 @@ struct NewDataHolder {
 
 static ARGS: Lazy<DedupArgs> = Lazy::new(|| DedupArgs::parse());
 
-impl FileContentInfo {
-  async fn create(
+impl FileStorageData {
+  async fn open(
     path: impl AsRef<Path>,
     file_metadata_found: mpsc::Sender<NewDataHolder>,
   ) -> Result<()> {
@@ -92,16 +101,15 @@ impl FileContentInfo {
         Err(e)
       }
     }?;
-    let file_info = FileContentInfo {
+    let file_info = FileStorageData {
       path: path.as_ref().to_path_buf(),
       size: reader.metadata().await?.len().try_into().unwrap(),
-      hash: HashValue::Incomplete(reader),
       storage_uid: link_metadata.get_storage_uid(),
       file_id: link_metadata.get_file_id(),
     };
     file_metadata_found
       .send(NewDataHolder {
-        data: NewData::FileContentInfo(file_info),
+        data: NewData::OpenFile(file_info, reader),
         sender: file_metadata_found.clone(),
       })
       .await
@@ -109,39 +117,38 @@ impl FileContentInfo {
     Ok(())
   }
 
-  async fn calculate_file_hash(self, file_hash_found: mpsc::Sender<NewDataHolder>) -> Result<()> {
-    if let HashValue::Incomplete(mut reader) = self.hash {
-      let mut read_buf = vec![0; 16 * 1024];
-      let mut hash = Xxh3::new();
-      let mut file_length = 0;
-      loop {
-        let bytes_read = reader.read(&mut read_buf[..]).await?;
-        file_length += bytes_read;
-        if bytes_read == 0 {
-          break;
-        }
-        hash.update(&read_buf[..bytes_read]);
+  async fn calculate_file_hash(
+    self,
+    mut reader: fs::File,
+    file_hash_found: mpsc::Sender<NewDataHolder>,
+  ) -> Result<()> {
+    let mut read_buf = vec![0; Lazy::force(&ARGS).buffer_size * 1024];
+    let mut hash = Xxh3::new();
+    let mut file_length = 0;
+    loop {
+      let bytes_read = reader.read(&mut read_buf[..]).await?;
+      file_length += bytes_read;
+      if bytes_read == 0 {
+        break;
       }
-      if file_length != self.size as usize {
-        return Err(Error::new(
-          ErrorKind::BrokenPipe,
-          format!(
-            "The entire file {} could not be hashed",
-            self.path.display()
-          ),
-        ))?;
-      }
-      file_hash_found
-        .send(NewDataHolder {
-          data: NewData::FileContentInfo(Self {
-            hash: HashValue::Hash(hash.digest128()),
-            ..self
-          }),
-          sender: file_hash_found.clone(),
-        })
-        .await
-        .unwrap();
+      hash.update(&read_buf[..bytes_read]);
     }
+    if file_length != self.size as usize {
+      return Err(Error::new(
+        ErrorKind::BrokenPipe,
+        format!(
+          "The entire file {} could not be hashed",
+          self.path.display()
+        ),
+      ))?;
+    }
+    file_hash_found
+      .send(NewDataHolder {
+        data: NewData::HashedFile(self, hash.digest128()),
+        sender: file_hash_found.clone(),
+      })
+      .await
+      .unwrap();
     Ok(())
   }
 }
@@ -175,7 +182,7 @@ async fn scan_dir(dir: PathBuf, entry_found_tx: mpsc::Sender<NewDataHolder>) -> 
       if size > 0 {
         entry_found_tx
           .send(NewDataHolder {
-            data: NewData::File(FileWithMetadata { path, size }),
+            data: NewData::File(SizedFile { path, size }),
             sender: entry_found_tx.clone(),
           })
           .await
@@ -184,6 +191,44 @@ async fn scan_dir(dir: PathBuf, entry_found_tx: mpsc::Sender<NewDataHolder>) -> 
     }
   }
   Ok(())
+}
+
+async fn compare_files(file1: impl AsRef<Path>, file2: impl AsRef<Path>) -> Result<bool> {
+  let (file1, file2) = join!(fs::File::open(&file1), fs::File::open(&file2));
+  let (mut file1, mut file2) = (file1?, file2?);
+  let buffer_size = Lazy::force(&ARGS).buffer_size;
+  let (mut buf_file1, mut buf_file2) = (vec![0; buffer_size * 1024], vec![0; buffer_size * 1024]);
+  let (buf_file1, buf_file2) = (&mut buf_file1, &mut buf_file2);
+  loop {
+    let (file1_read, file2_read) = join!(
+      file1.read(&mut buf_file1[..]),
+      file2.read(&mut buf_file2[..])
+    );
+    match (file1_read?, file2_read?) {
+      (0, 0) => {
+        return Ok(true);
+      }
+      (mut file1_read, mut file2_read) => {
+        while file1_read < file2_read {
+          let new_read = file1.read(&mut buf_file1[file1_read..file2_read]).await?;
+          if new_read == 0 {
+            return Ok(false);
+          }
+          file1_read += new_read;
+        }
+        while file2_read < file1_read {
+          let new_read = file2.read(&mut buf_file2[file2_read..file1_read]).await?;
+          if new_read == 0 {
+            return Ok(false);
+          }
+          file2_read += new_read;
+        }
+        if buf_file1[..file1_read] != buf_file2[..file2_read] {
+          return Ok(false);
+        }
+      }
+    }
+  }
 }
 
 async fn merge_with_hard_link(file1: impl AsRef<Path>, file2: impl AsRef<Path>) -> Result<()> {
@@ -244,7 +289,7 @@ async fn main() {
   let args = Lazy::force(&ARGS);
   let (file_found_tx, mut file_found_rx) =
     mpsc::channel::<NewDataHolder>(max(100, args.path.len()));
-  let (new_file_data_tx, mut new_file_data_rx) = mpsc::channel::<FileContentInfo>(10);
+  let (new_file_data_tx, mut new_file_data_rx) = mpsc::channel::<(FileStorageData, HashDigest)>(10);
 
   spawn(async move {
     for path in &args.path {
@@ -252,7 +297,7 @@ async fn main() {
     }
     drop(file_found_tx);
     let mut found_files = HashMap::<Filesize, FilesizeStatus>::new();
-    let mut file_id_hashes = HashMap::<(StorageUid, FileId), HashDigest>::new();
+    let mut hash_requested = HashSet::<(StorageUid, FileId)>::new();
     while let Some(new_data) = file_found_rx.recv().await {
       match new_data {
         NewDataHolder {
@@ -261,7 +306,7 @@ async fn main() {
         } => match found_files.insert(new_file.size, FilesizeStatus::FoundOne(new_file.path)) {
           None => (),
           Some(FilesizeStatus::FoundOne(other_file)) => {
-            spawn(FileContentInfo::create(other_file, sender.clone()));
+            spawn(FileStorageData::open(other_file, sender.clone()));
             let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
               .insert(new_file.size, FilesizeStatus::FoundMultiple)
               .unwrap()
@@ -270,7 +315,7 @@ async fn main() {
             } else {
               unreachable!()
             };
-            spawn(FileContentInfo::create(new_file, sender.clone()));
+            spawn(FileStorageData::open(new_file, sender.clone()));
           }
           Some(FilesizeStatus::FoundMultiple) => {
             let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
@@ -281,26 +326,25 @@ async fn main() {
             } else {
               unreachable!()
             };
-            spawn(FileContentInfo::create(new_file, sender.clone()));
+            spawn(FileStorageData::open(new_file, sender.clone()));
           }
         },
         NewDataHolder {
-          data: NewData::FileContentInfo(file_info),
+          data: NewData::OpenFile(file_info, file_reader),
           sender,
         } => {
-          let hash_identifier = (file_info.storage_uid, file_info.file_id);
-          match file_info.hash {
-            HashValue::Incomplete(..) => {
-              if file_id_hashes.get(&hash_identifier).is_none() {
-                spawn(file_info.calculate_file_hash(sender));
-              }
-            }
-            HashValue::Hash(hash_digest) => {
-              file_id_hashes.insert(hash_identifier, hash_digest);
-              new_file_data_tx.send(file_info).await.unwrap()
-            }
+          let key = file_info.unique_id();
+          if hash_requested.insert(key) {
+            spawn(file_info.calculate_file_hash(file_reader, sender));
           }
         }
+        NewDataHolder {
+          data: NewData::HashedFile(file_info, hash_digest),
+          ..
+        } => new_file_data_tx
+          .send((file_info, hash_digest))
+          .await
+          .unwrap(),
         NewDataHolder {
           data: NewData::Dir(dir),
           sender,
@@ -314,17 +358,30 @@ async fn main() {
   let mut unique_files = HashMap::<(StorageUid, Filesize, HashDigest), (PathBuf, FileId)>::new();
   let mut wasted_space: Filesize = 0;
 
-  while let Some(file_info) = new_file_data_rx.recv().await {
-    let hash_digest = if let HashValue::Hash(hash_digest) = file_info.hash {
-      hash_digest
-    } else {
-      unreachable!()
-    };
+  while let Some((file_info, hash_digest)) = new_file_data_rx.recv().await {
     let identifier = (file_info.storage_uid, file_info.size, hash_digest);
     match unique_files.get_mut(&identifier) {
       Some((ref similar_file_path, ref similar_file_id)) => {
         if similar_file_id == &file_info.file_id {
           continue;
+        }
+        if args.paranoid {
+          match compare_files(&similar_file_path, &file_info.path).await {
+            Ok(false) => unreachable!(
+              "Same hash for differing files {} and {}",
+              similar_file_path.display(),
+              file_info.path.display()
+            ),
+            Ok(true) => (),
+            Err(e) => {
+              eprintln!(
+                "Failed to compare {} with {}: {}",
+                similar_file_path.display(),
+                file_info.path.display(),
+                e
+              );
+            }
+          }
         }
         match merge_with_hard_link(&similar_file_path, &file_info.path).await {
           Ok(()) => {
