@@ -1,3 +1,4 @@
+use blake3::{Hasher, OUT_LEN as HASH_LEN};
 use clap::{ArgAction, Parser};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -9,12 +10,11 @@ use std::{
   path::{Path, PathBuf},
 };
 use tokio::{fs, io::AsyncReadExt, join, spawn, sync::mpsc};
-use xxhash_rust::xxh3::Xxh3;
 
 mod os;
 use os::{FileBackend, FileId, FileLinkBackend, StorageUid};
 
-type HashDigest = u128;
+type HashDigest = [u8; HASH_LEN];
 type Filesize = u64;
 
 #[derive(Debug, Parser)]
@@ -123,7 +123,7 @@ impl FileStorageData {
     file_hash_found: mpsc::Sender<NewDataHolder>,
   ) -> Result<()> {
     let mut read_buf = vec![0; Lazy::force(&ARGS).buffer_size * 1024];
-    let mut hash = Xxh3::new();
+    let mut hash = Hasher::new();
     let mut file_length = 0;
     loop {
       let bytes_read = reader.read(&mut read_buf[..]).await?;
@@ -144,7 +144,7 @@ impl FileStorageData {
     }
     file_hash_found
       .send(NewDataHolder {
-        data: NewData::HashedFile(self, hash.digest128()),
+        data: NewData::HashedFile(self, hash.finalize().into()),
         sender: file_hash_found.clone(),
       })
       .await

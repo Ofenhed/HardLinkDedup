@@ -11,7 +11,7 @@ description = "A tool to save space by replacing duplicate files with hard links
 
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "io-util", "io-std", "fs", "sync", "macros"] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = "1.3"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 once_cell = "1"
