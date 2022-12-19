@@ -8,7 +8,7 @@ use std::{
   io::{Error, ErrorKind, Result},
   path::{Path, PathBuf},
 };
-use tokio::{fs, io::AsyncReadExt, spawn, sync::mpsc};
+use tokio::{fs, io::AsyncReadExt, join, spawn, sync::mpsc};
 
 mod os;
 use os::{FileBackend, FileId, FileLinkBackend, StorageUid};
@@ -236,7 +236,7 @@ async fn merge_with_hard_link(file1: impl AsRef<Path>, file2: impl AsRef<Path>) 
 }
 
 enum FilesizeStatus {
-  FoundOne(PathBuf),
+  FoundOne(PathBuf, Option<(StorageUid, FileId)>),
   FoundMultiple,
 }
 
@@ -262,13 +262,31 @@ async fn main() {
           data: NewData::File(new_file),
           sender,
         } => match found_files.entry(new_file.size) {
-          Entry::Occupied(mut entry) => match entry.get() {
+          Entry::Occupied(mut entry) => match entry.get_mut() {
             FilesizeStatus::FoundMultiple => {
               spawn(FileStorageData::open(new_file.path, sender));
             }
-            FilesizeStatus::FoundOne(ref other_file) => {
-              if new_file.path.same_file(other_file).await.ok() != Some(true) {
-                let other_file = if let FilesizeStatus::FoundOne(other_file) =
+            FilesizeStatus::FoundOne(ref other_file, ref mut other_file_uid) => {
+              let same_file = match other_file_uid {
+                Some(ref other_file_uid) => match new_file.path.link_metadata().await {
+                  Ok(new_file_metadata) => other_file_uid == &new_file_metadata.get_file_uid(),
+                  Err(..) => false,
+                },
+                None => match join!(other_file.link_metadata(), new_file.path.link_metadata()) {
+                  (Ok(ref other_file_new_metadata), Ok(ref new_file_metadata)) => {
+                    let other_file_new_uid = other_file_new_metadata.get_file_uid();
+                    *other_file_uid = Some(other_file_new_uid);
+                    other_file_new_uid == new_file_metadata.get_file_uid()
+                  }
+                  (Ok(ref other_file_new_metadata), _) => {
+                    *other_file_uid = Some(other_file_new_metadata.get_file_uid());
+                    false
+                  }
+                  _ => false,
+                },
+              };
+              if !same_file {
+                let other_file = if let FilesizeStatus::FoundOne(other_file, _) =
                   entry.insert(FilesizeStatus::FoundMultiple)
                 {
                   other_file
@@ -281,7 +299,7 @@ async fn main() {
             }
           },
           Entry::Vacant(entry) => {
-            entry.insert(FilesizeStatus::FoundOne(new_file.path));
+            entry.insert(FilesizeStatus::FoundOne(new_file.path, None));
           }
         },
         NewDataHolder {
