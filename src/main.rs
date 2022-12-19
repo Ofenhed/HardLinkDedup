@@ -9,7 +9,7 @@ use std::{
   io::{Error, ErrorKind, Result},
   path::{Path, PathBuf},
 };
-use tokio::{fs, io::AsyncReadExt, join, spawn, sync::mpsc};
+use tokio::{fs, io::AsyncReadExt, spawn, sync::mpsc};
 
 mod os;
 use os::{FileBackend, FileId, FileLinkBackend, StorageUid};
@@ -41,11 +41,6 @@ struct DedupArgs {
   /// hard linking the files.
   #[arg(short, long, action = ArgAction::SetTrue)]
   not_readonly: bool,
-
-  /// Fully compare files before overwriting. This is a lot more expensive than checking hashes,
-  /// which is the default behaviour.
-  #[arg(short = 'f', long, action = ArgAction::SetTrue)]
-  paranoid: bool,
 
   /// Paths where files will be deduplicated.
   #[arg(required = true, value_hint = clap::ValueHint::DirPath)]
@@ -193,44 +188,6 @@ async fn scan_dir(dir: PathBuf, entry_found_tx: mpsc::Sender<NewDataHolder>) -> 
   Ok(())
 }
 
-async fn compare_files(file1: impl AsRef<Path>, file2: impl AsRef<Path>) -> Result<bool> {
-  let (file1, file2) = join!(fs::File::open(&file1), fs::File::open(&file2));
-  let (mut file1, mut file2) = (file1?, file2?);
-  let buffer_size = Lazy::force(&ARGS).buffer_size;
-  let (mut buf_file1, mut buf_file2) = (vec![0; buffer_size * 1024], vec![0; buffer_size * 1024]);
-  let (buf_file1, buf_file2) = (&mut buf_file1, &mut buf_file2);
-  loop {
-    let (file1_read, file2_read) = join!(
-      file1.read(&mut buf_file1[..]),
-      file2.read(&mut buf_file2[..])
-    );
-    match (file1_read?, file2_read?) {
-      (0, 0) => {
-        return Ok(true);
-      }
-      (mut file1_read, mut file2_read) => {
-        while file1_read < file2_read {
-          let new_read = file1.read(&mut buf_file1[file1_read..file2_read]).await?;
-          if new_read == 0 {
-            return Ok(false);
-          }
-          file1_read += new_read;
-        }
-        while file2_read < file1_read {
-          let new_read = file2.read(&mut buf_file2[file2_read..file1_read]).await?;
-          if new_read == 0 {
-            return Ok(false);
-          }
-          file2_read += new_read;
-        }
-        if buf_file1[..file1_read] != buf_file2[..file2_read] {
-          return Ok(false);
-        }
-      }
-    }
-  }
-}
-
 async fn merge_with_hard_link(file1: impl AsRef<Path>, file2: impl AsRef<Path>) -> Result<()> {
   let args = Lazy::force(&ARGS);
   let new_file = if let Some(new_file_name) = file2.as_ref().file_name() {
@@ -359,24 +316,6 @@ async fn main() {
       Some((ref similar_file_path, ref similar_file_id)) => {
         if similar_file_id == &file_info.file_id {
           continue;
-        }
-        if args.paranoid {
-          match compare_files(&similar_file_path, &file_info.path).await {
-            Ok(false) => unreachable!(
-              "Same hash for differing files {} and {}",
-              similar_file_path.display(),
-              file_info.path.display()
-            ),
-            Ok(true) => (),
-            Err(e) => {
-              eprintln!(
-                "Failed to compare {} with {}: {}",
-                similar_file_path.display(),
-                file_info.path.display(),
-                e
-              );
-            }
-          }
         }
         match merge_with_hard_link(&similar_file_path, &file_info.path).await {
           Ok(()) => {
