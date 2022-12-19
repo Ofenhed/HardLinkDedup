@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
   cmp::max,
-  collections::{HashMap, HashSet},
+  collections::{hash_map::Entry, HashMap, HashSet},
   ffi::OsString,
   io::{Error, ErrorKind, Result},
   path::{Path, PathBuf},
@@ -303,30 +303,25 @@ async fn main() {
         NewDataHolder {
           data: NewData::File(new_file),
           sender,
-        } => match found_files.insert(new_file.size, FilesizeStatus::FoundOne(new_file.path)) {
-          None => (),
-          Some(FilesizeStatus::FoundOne(other_file)) => {
-            spawn(FileStorageData::open(other_file, sender.clone()));
-            let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
-              .insert(new_file.size, FilesizeStatus::FoundMultiple)
-              .unwrap()
-            {
-              new_file
-            } else {
-              unreachable!()
-            };
-            spawn(FileStorageData::open(new_file, sender.clone()));
-          }
-          Some(FilesizeStatus::FoundMultiple) => {
-            let new_file = if let FilesizeStatus::FoundOne(new_file) = found_files
-              .insert(new_file.size, FilesizeStatus::FoundMultiple)
-              .unwrap()
-            {
-              new_file
-            } else {
-              unreachable!()
-            };
-            spawn(FileStorageData::open(new_file, sender.clone()));
+        } => match found_files.entry(new_file.size) {
+          Entry::Occupied(mut entry) => match entry.get() {
+            FilesizeStatus::FoundMultiple => {
+              spawn(FileStorageData::open(new_file.path, sender));
+            }
+            FilesizeStatus::FoundOne(_) => {
+              let other_file = if let FilesizeStatus::FoundOne(other_file) =
+                entry.insert(FilesizeStatus::FoundMultiple)
+              {
+                other_file
+              } else {
+                unreachable!()
+              };
+              spawn(FileStorageData::open(new_file.path, sender.clone()));
+              spawn(FileStorageData::open(other_file, sender));
+            }
+          },
+          Entry::Vacant(entry) => {
+            entry.insert(FilesizeStatus::FoundOne(new_file.path));
           }
         },
         NewDataHolder {
