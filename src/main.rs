@@ -3,7 +3,6 @@ use clap::{ArgAction, Parser};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
-  cmp::max,
   collections::{hash_map::Entry, HashMap, HashSet},
   ffi::OsString,
   io::{Error, ErrorKind, Result},
@@ -244,8 +243,7 @@ enum FilesizeStatus {
 #[tokio::main]
 async fn main() {
   let args = Lazy::force(&ARGS);
-  let (file_found_tx, mut file_found_rx) =
-    mpsc::channel::<NewDataHolder>(max(100, args.path.len()));
+  let (file_found_tx, mut file_found_rx) = mpsc::channel::<NewDataHolder>(100);
   let (new_file_data_tx, mut new_file_data_rx) = mpsc::channel::<(FileStorageData, HashDigest)>(10);
 
   spawn(async move {
@@ -253,6 +251,9 @@ async fn main() {
       spawn(scan_dir(path.to_owned(), file_found_tx.clone()));
     }
     drop(file_found_tx);
+  });
+
+  spawn(async move {
     let mut found_files = HashMap::<Filesize, FilesizeStatus>::new();
     let mut hash_requested = HashSet::<(StorageUid, FileId)>::new();
     while let Some(new_data) = file_found_rx.recv().await {
