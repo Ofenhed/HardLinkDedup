@@ -266,16 +266,18 @@ async fn main() {
             FilesizeStatus::FoundMultiple => {
               spawn(FileStorageData::open(new_file.path, sender));
             }
-            FilesizeStatus::FoundOne(_) => {
-              let other_file = if let FilesizeStatus::FoundOne(other_file) =
-                entry.insert(FilesizeStatus::FoundMultiple)
-              {
-                other_file
-              } else {
-                unreachable!()
-              };
-              spawn(FileStorageData::open(new_file.path, sender.clone()));
-              spawn(FileStorageData::open(other_file, sender));
+            FilesizeStatus::FoundOne(ref other_file) => {
+              if new_file.path.same_file(other_file).await.ok() != Some(true) {
+                let other_file = if let FilesizeStatus::FoundOne(other_file) =
+                  entry.insert(FilesizeStatus::FoundMultiple)
+                {
+                  other_file
+                } else {
+                  unreachable!()
+                };
+                spawn(FileStorageData::open(new_file.path, sender.clone()));
+                spawn(FileStorageData::open(other_file, sender));
+              }
             }
           },
           Entry::Vacant(entry) => {
