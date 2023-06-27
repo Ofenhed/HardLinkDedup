@@ -4,7 +4,7 @@ use std::{
   fs::File,
   io::{Error, Result},
   os::windows::io::AsRawHandle,
-  path::PathBuf,
+  path::Path,
 };
 use tokio::fs;
 use windows::Win32::{
@@ -39,7 +39,7 @@ impl FileBackend for fs::File {
 }
 
 #[async_trait]
-impl FileBackend for PathBuf {
+impl FileBackend for &Path {
   type Metadata = BY_HANDLE_FILE_INFORMATION;
 
   async fn link_metadata(&self) -> Result<Self::Metadata> {

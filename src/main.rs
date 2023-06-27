@@ -1,17 +1,21 @@
-use blake3::{Hasher, OUT_LEN as HASH_LEN};
+use blake3::OUT_LEN as HASH_LEN;
 use clap::{ArgAction, Parser};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::{
   collections::{hash_map::Entry, HashMap, HashSet},
   ffi::OsString,
-  io::{Error, ErrorKind, Result},
+  io::Result,
   path::{Path, PathBuf},
+  sync::OnceLock,
 };
-use tokio::{fs, io::AsyncReadExt, join, spawn, sync::mpsc};
+use storage::FileStorageData;
+use tokio::{fs, task::JoinSet};
 
 mod os;
-use os::{FileBackend, FileId, FileLinkBackend, StorageUid};
+mod storage;
+use os::{FileId, StorageUid};
+
+use crate::storage::calculate_file_hash;
 
 type HashDigest = [u8; HASH_LEN];
 type Filesize = u64;
@@ -46,121 +50,36 @@ struct DedupArgs {
   path: Vec<PathBuf>,
 }
 
-#[derive(Debug)]
-struct SizedFile {
-  path: PathBuf,
-  size: Filesize,
-}
+//#[derive(Debug)]
+// struct SizedFile {
+//  path: PathBuf,
+//  size: Filesize,
+//}
 
 #[derive(Debug)]
-struct FileStorageData {
-  path: PathBuf,
-  size: Filesize,
-  storage_uid: StorageUid,
-  file_id: FileId,
-}
-
-impl FileStorageData {
-  fn unique_id(&self) -> (StorageUid, FileId) {
-    (self.storage_uid, self.file_id)
-  }
-}
-
-#[derive(Debug)]
-enum NewData {
-  File(SizedFile),
-  OpenFile(FileStorageData, fs::File),
-  HashedFile(FileStorageData, HashDigest),
+enum ScanDirResult {
   Dir(PathBuf),
+  File(FileStorageData),
 }
 
-#[derive(Debug)]
-struct NewDataHolder {
-  data: NewData,
-  sender: mpsc::Sender<NewDataHolder>,
-}
+static ARGS: OnceLock<DedupArgs> = OnceLock::new();
 
-static ARGS: Lazy<DedupArgs> = Lazy::new(|| DedupArgs::parse());
-
-impl FileStorageData {
-  async fn open(
-    path: impl AsRef<Path>,
-    file_metadata_found: mpsc::Sender<NewDataHolder>,
-  ) -> Result<()> {
-    let reader = fs::File::open(&path).await?;
-    let link_metadata = match reader.link_metadata().await {
-      Ok(x) => Ok(x),
-      Err(e) => {
-        println!("Error: {}", e);
-        Err(e)
-      }
-    }?;
-    let file_info = FileStorageData {
-      path: path.as_ref().to_path_buf(),
-      size: reader.metadata().await?.len().try_into().unwrap(),
-      storage_uid: link_metadata.get_storage_uid(),
-      file_id: link_metadata.get_file_id(),
-    };
-    file_metadata_found
-      .send(NewDataHolder {
-        data: NewData::OpenFile(file_info, reader),
-        sender: file_metadata_found.clone(),
-      })
-      .await
-      .unwrap();
-    Ok(())
-  }
-
-  async fn calculate_file_hash(
-    self,
-    mut reader: fs::File,
-    file_hash_found: mpsc::Sender<NewDataHolder>,
-  ) -> Result<()> {
-    let mut read_buf = vec![0; Lazy::force(&ARGS).buffer_size * 1024];
-    let mut hash = Hasher::new();
-    let mut file_length = 0;
-    loop {
-      let bytes_read = reader.read(&mut read_buf[..]).await?;
-      file_length += bytes_read;
-      if bytes_read == 0 {
-        break;
-      }
-      hash.update(&read_buf[..bytes_read]);
-    }
-    if file_length != self.size as usize {
-      return Err(Error::new(
-        ErrorKind::BrokenPipe,
-        format!(
-          "The entire file {} could not be hashed",
-          self.path.display()
-        ),
-      ))?;
-    }
-    file_hash_found
-      .send(NewDataHolder {
-        data: NewData::HashedFile(self, hash.finalize().into()),
-        sender: file_hash_found.clone(),
-      })
-      .await
-      .unwrap();
-    Ok(())
+impl DedupArgs {
+  pub fn get() -> &'static Self {
+    ARGS.get_or_init(|| DedupArgs::parse())
   }
 }
 
-async fn scan_dir(dir: PathBuf, entry_found_tx: mpsc::Sender<NewDataHolder>) -> Result<()> {
+async fn scan_dir(dir: PathBuf) -> Result<Vec<ScanDirResult>> {
   let mut reader = fs::read_dir(dir).await?;
+  let mut result = vec![];
   while let Some(entry) = reader.next_entry().await? {
-    let metadata = entry.metadata().await?;
+    let path = entry.path();
+    let metadata = fs::metadata(&path).await?;
     if metadata.is_dir() {
-      entry_found_tx
-        .send(NewDataHolder {
-          data: NewData::Dir(entry.path()),
-          sender: entry_found_tx.clone(),
-        })
-        .await
-        .unwrap();
+      result.push(ScanDirResult::Dir(entry.path()));
     } else if metadata.is_file() {
-      if let Some(ref pattern) = Lazy::force(&ARGS).pattern {
+      if let Some(ref pattern) = DedupArgs::get().pattern {
         if let Some(file_name) = entry.path().file_name().map(|name| name.to_string_lossy()) {
           if let Some(found) = pattern.find(&file_name) {
             if found.start() != 0 || found.end() != file_name.len() {
@@ -171,189 +90,180 @@ async fn scan_dir(dir: PathBuf, entry_found_tx: mpsc::Sender<NewDataHolder>) -> 
           }
         }
       }
-      let size = metadata.len();
-      let path = entry.path();
-      if size > 0 {
-        entry_found_tx
-          .send(NewDataHolder {
-            data: NewData::File(SizedFile { path, size }),
-            sender: entry_found_tx.clone(),
-          })
-          .await
-          .unwrap();
+      let file = FileStorageData::new(&path).await?;
+      if file.size > 0 {
+        result.push(ScanDirResult::File(file));
       }
     }
   }
-  Ok(())
+  Ok(result)
 }
 
-async fn merge_with_hard_link(file1: impl AsRef<Path>, file2: impl AsRef<Path>) -> Result<()> {
-  let args = Lazy::force(&ARGS);
-  let new_file = if let Some(new_file_name) = file2.as_ref().file_name() {
+async fn merge_with_hard_link(
+  original: impl AsRef<Path>,
+  redundant: impl AsRef<Path>,
+) -> Result<()> {
+  let args = DedupArgs::get();
+  let new_file = if let Some(new_file_name) = redundant.as_ref().file_name() {
     let mut new_file_name = new_file_name.to_owned();
     new_file_name.push(".");
     new_file_name.push(&args.temporary_extension);
-    file2.as_ref().with_file_name(new_file_name)
+    redundant.as_ref().with_file_name(new_file_name)
   } else {
     unreachable!()
   };
 
   if args.dry_run {
     println!(
-      "Creating file {} linked with {}",
-      new_file.display(),
-      file1.as_ref().display()
+      "Linking file {} to {}",
+      redundant.as_ref().display(),
+      original.as_ref().display()
     );
   } else {
-    fs::hard_link(&file1, &new_file).await?;
+    fs::hard_link(&original, &new_file).await?;
   }
-  if args.dry_run {
-    println!(
-      "Renaming file {} to {}",
-      new_file.display(),
-      file2.as_ref().display()
-    );
-  } else {
-    if let Err(e) = fs::rename(&new_file, &file2).await {
+  if !args.dry_run {
+    if let Err(e) = fs::rename(&new_file, &redundant).await {
       fs::remove_file(new_file).await?;
       return Err(e)?;
     }
   }
   if !args.not_readonly {
     if args.dry_run {
-      if !fs::metadata(&file1).await?.permissions().readonly() {
-        println!("Applying readonly to {} ", file1.as_ref().display());
+      if !fs::metadata(&original).await?.permissions().readonly() {
+        println!("Applying readonly to {} ", original.as_ref().display());
       }
     } else {
-      let mut permissions = fs::metadata(&file1).await?.permissions();
+      let mut permissions = fs::metadata(&original).await?.permissions();
       if !permissions.readonly() {
         permissions.set_readonly(true);
-        fs::set_permissions(&file1, permissions).await?;
+        fs::set_permissions(&original, permissions).await?;
       }
     }
   }
   Ok(())
 }
 
-enum FilesizeStatus {
-  FoundOne(PathBuf, Option<(StorageUid, FileId)>),
-  FoundMultiple,
-}
-
 #[tokio::main]
-async fn main() {
-  let args = Lazy::force(&ARGS);
-  let (file_found_tx, mut file_found_rx) = mpsc::channel::<NewDataHolder>(100);
-  let (new_file_data_tx, mut new_file_data_rx) = mpsc::channel::<(FileStorageData, HashDigest)>(10);
+async fn main() -> Result<()> {
+  let args = DedupArgs::get();
 
-  spawn(async move {
-    for path in &args.path {
-      spawn(scan_dir(path.to_owned(), file_found_tx.clone()));
-    }
-    drop(file_found_tx);
-  });
+  enum WorkerResult {
+    ScanResult(Vec<ScanDirResult>),
+    NewHashReceived(StorageUid, FileId, (Filesize, HashDigest)),
+  }
+  let mut worker = JoinSet::<Result<WorkerResult>>::new();
 
-  spawn(async move {
-    let mut found_files = HashMap::<Filesize, FilesizeStatus>::new();
-    let mut hash_requested = HashSet::<(StorageUid, FileId)>::new();
-    while let Some(new_data) = file_found_rx.recv().await {
-      match new_data {
-        NewDataHolder {
-          data: NewData::File(new_file),
-          sender,
-        } => match found_files.entry(new_file.size) {
-          Entry::Occupied(mut entry) => match entry.get_mut() {
-            FilesizeStatus::FoundMultiple => {
-              spawn(FileStorageData::open(new_file.path, sender));
+  for path in &args.path {
+    worker.spawn(async { Ok(WorkerResult::ScanResult(scan_dir(path.to_owned()).await?)) });
+  }
+
+  #[derive(Debug, Default)]
+  struct StorageContent {
+    file_sizes: HashMap<Filesize, HashSet<FileId>>,
+    hashes: HashMap<(Filesize, HashDigest), HashSet<FileId>>,
+    files: HashMap<FileId, (PathBuf, Vec<PathBuf>)>,
+  }
+  let mut known_files = HashMap::<StorageUid, StorageContent>::new();
+  while let Some(found_files) = worker.join_next().await {
+    match found_files?? {
+      WorkerResult::ScanResult(files) => {
+        for file in files {
+          match file {
+            ScanDirResult::Dir(path) => {
+              worker.spawn(async { Ok(WorkerResult::ScanResult(scan_dir(path).await?)) });
             }
-            FilesizeStatus::FoundOne(ref other_file, ref mut other_file_uid) => {
-              let same_file = match other_file_uid {
-                Some(ref other_file_uid) => match new_file.path.link_metadata().await {
-                  Ok(new_file_metadata) => other_file_uid == &new_file_metadata.get_file_uid(),
-                  Err(..) => false,
-                },
-                None => match join!(other_file.link_metadata(), new_file.path.link_metadata()) {
-                  (Ok(ref other_file_new_metadata), Ok(ref new_file_metadata)) => {
-                    let other_file_new_uid = other_file_new_metadata.get_file_uid();
-                    *other_file_uid = Some(other_file_new_uid);
-                    other_file_new_uid == new_file_metadata.get_file_uid()
+            ScanDirResult::File(storage_data) => {
+              let storage = known_files.entry(storage_data.storage_uid).or_default();
+              match storage.files.entry(storage_data.file_id) {
+                Entry::Occupied(mut entry) => {
+                  entry.get_mut().1.push(storage_data.path);
+                }
+                Entry::Vacant(entry) => {
+                  entry.insert((storage_data.path.to_owned(), vec![]));
+                  match storage.file_sizes.entry(storage_data.size) {
+                    Entry::Occupied(mut entry) => {
+                      let other_files = entry.get_mut();
+                      let mut files_iter = other_files.iter();
+                      let first_file =
+                        if let (Some(file), None) = (files_iter.next(), files_iter.next()) {
+                          Some(file.to_owned())
+                        } else {
+                          None
+                        };
+                      other_files.insert(storage_data.file_id);
+                      if let Some(first_file_id) = first_file {
+                        let first_file_path = storage
+                          .files
+                          .get(&first_file_id)
+                          .expect("This file id has to exist")
+                          .0
+                          .clone();
+                        let storage_uid = storage_data.storage_uid;
+                        let file_size = storage_data.size;
+                        worker.spawn(async move {
+                          Ok(WorkerResult::NewHashReceived(
+                            storage_uid,
+                            first_file_id,
+                            (
+                              file_size,
+                              calculate_file_hash(first_file_path, file_size).await?,
+                            ),
+                          ))
+                        });
+                      }
+                      worker.spawn(async move {
+                        Ok(WorkerResult::NewHashReceived(
+                          storage_data.storage_uid,
+                          storage_data.file_id,
+                          (
+                            storage_data.size,
+                            calculate_file_hash(storage_data.path, storage_data.size).await?,
+                          ),
+                        ))
+                      });
+                    }
+                    entry @ Entry::Vacant(..) => {
+                      entry.or_default().insert(storage_data.file_id);
+                    }
                   }
-                  (Ok(ref other_file_new_metadata), _) => {
-                    *other_file_uid = Some(other_file_new_metadata.get_file_uid());
-                    false
-                  }
-                  _ => false,
-                },
-              };
-              if !same_file {
-                let other_file = if let FilesizeStatus::FoundOne(other_file, _) =
-                  entry.insert(FilesizeStatus::FoundMultiple)
-                {
-                  other_file
-                } else {
-                  unreachable!()
-                };
-                spawn(FileStorageData::open(new_file.path, sender.clone()));
-                spawn(FileStorageData::open(other_file, sender));
+                }
               }
             }
-          },
-          Entry::Vacant(entry) => {
-            entry.insert(FilesizeStatus::FoundOne(new_file.path, None));
-          }
-        },
-        NewDataHolder {
-          data: NewData::OpenFile(file_info, file_reader),
-          sender,
-        } => {
-          let key = file_info.unique_id();
-          if hash_requested.insert(key) {
-            spawn(file_info.calculate_file_hash(file_reader, sender));
           }
         }
-        NewDataHolder {
-          data: NewData::HashedFile(file_info, hash_digest),
-          ..
-        } => new_file_data_tx
-          .send((file_info, hash_digest))
-          .await
-          .unwrap(),
-        NewDataHolder {
-          data: NewData::Dir(dir),
-          sender,
-        } => {
-          spawn(scan_dir(dir, sender));
+      }
+      WorkerResult::NewHashReceived(storage_uid, file_id, digest) => {
+        let Entry::Occupied(mut storage) = known_files.entry(storage_uid) else { unreachable!("Always set by this point") };
+        storage
+          .get_mut()
+          .hashes
+          .entry(digest)
+          .or_default()
+          .insert(file_id);
+      }
+    }
+  }
+
+  let mut wasted_space: Filesize = 0;
+  for storage in known_files.values() {
+    for ((file_size, _hash), duplicates) in storage.hashes.iter().filter(|(_, x)| x.len() > 1) {
+      let mut files = duplicates
+        .iter()
+        .flat_map(|x| {
+          let (first, rest) = storage.files.get(x).expect("File id will exist here");
+          let mut result = rest.to_owned();
+          result.push(first.to_owned());
+          result
+        })
+        .collect::<Vec<_>>();
+      if let Some(original_file) = files.pop() {
+        for duplicate in files {
+          merge_with_hard_link(&original_file, duplicate).await?;
+          wasted_space += file_size;
         }
       }
     }
-  });
-
-  let mut unique_files = HashMap::<(StorageUid, Filesize, HashDigest), (PathBuf, FileId)>::new();
-  let mut wasted_space: Filesize = 0;
-
-  while let Some((file_info, hash_digest)) = new_file_data_rx.recv().await {
-    let identifier = (file_info.storage_uid, file_info.size, hash_digest);
-    match unique_files.get_mut(&identifier) {
-      Some((ref similar_file_path, ref similar_file_id)) => {
-        if similar_file_id == &file_info.file_id {
-          continue;
-        }
-        match merge_with_hard_link(&similar_file_path, &file_info.path).await {
-          Ok(()) => {
-            wasted_space += file_info.size;
-          }
-          Err(e) => eprintln!(
-            "Failed to merge {} with {}: {}",
-            similar_file_path.display(),
-            file_info.path.display(),
-            e
-          ),
-        }
-      }
-      None => {
-        unique_files.insert(identifier, (file_info.path, file_info.file_id));
-      }
-    };
   }
 
   println!(
@@ -361,4 +271,5 @@ async fn main() {
     wasted_space / (1024 * 1024),
     if args.dry_run { "can be" } else { "was" }
   );
+  Ok(())
 }

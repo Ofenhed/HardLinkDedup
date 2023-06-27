@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::{fs::File, hash::Hash, io::Result};
+use std::{fs::File, hash::Hash, io::Result, path::Path};
 use tokio::join;
 
 #[cfg(unix)]
@@ -35,7 +35,10 @@ pub trait FileLinkBackend {
 }
 
 #[async_trait]
-pub trait FileBackend {
+pub trait FileBackend
+where
+  Self: Sized,
+{
   type Metadata: FileLinkBackend + Send;
   async fn link_metadata(&self) -> Result<Self::Metadata>;
   async fn same_file(&self, other: &Self) -> Result<bool> {
@@ -44,5 +47,10 @@ pub trait FileBackend {
   }
 }
 
-pub type StorageUid = <<File as FileBackend>::Metadata as FileLinkBackend>::StorageUid;
-pub type FileId = <<File as FileBackend>::Metadata as FileLinkBackend>::FileId;
+pub async fn read_link_metadata<'a>(from: impl AsRef<Path> + 'a) -> Result<CurrentFileLinkBackend> {
+  from.as_ref().link_metadata().await
+}
+
+pub type CurrentFileLinkBackend = <File as FileBackend>::Metadata;
+pub type StorageUid = <CurrentFileLinkBackend as FileLinkBackend>::StorageUid;
+pub type FileId = <CurrentFileLinkBackend as FileLinkBackend>::FileId;

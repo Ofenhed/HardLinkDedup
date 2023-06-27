@@ -27,7 +27,7 @@ impl FileBackend for File {
 }
 
 #[async_trait]
-impl FileBackend for PathBuf {
+impl FileBackend for &Path {
   type Metadata = Metadata;
 
   async fn link_metadata(&self) -> Result<Self::Metadata> {
