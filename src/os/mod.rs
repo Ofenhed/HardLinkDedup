@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use std::{fs::File, hash::Hash, io::Result, path::Path};
-use tokio::join;
 
 #[cfg(unix)]
 mod unix;
@@ -40,11 +39,7 @@ where
   Self: Sized,
 {
   type Metadata: FileLinkBackend + Send;
-  async fn link_metadata(&self) -> Result<Self::Metadata>;
-  async fn same_file(&self, other: &Self) -> Result<bool> {
-    let (file1, file2) = join!(self.link_metadata(), other.link_metadata());
-    Ok(file1?.get_file_uid() == file2?.get_file_uid())
-  }
+  async fn link_metadata(self) -> Result<Self::Metadata>;
 }
 
 pub async fn read_link_metadata<'a>(from: impl AsRef<Path> + 'a) -> Result<CurrentFileLinkBackend> {

@@ -1,21 +1,19 @@
+use anyhow::{Context, Result};
 use blake3::OUT_LEN as HASH_LEN;
 use clap::{ArgAction, Parser};
 use regex::Regex;
 use std::{
   collections::{hash_map::Entry, HashMap, HashSet},
   ffi::OsString,
-  io::Result,
   path::{Path, PathBuf},
-  sync::OnceLock,
+  sync::{Arc, OnceLock},
 };
-use storage::FileStorageData;
 use tokio::{fs, task::JoinSet};
 
 mod os;
 mod storage;
 use os::{FileId, StorageUid};
-
-use crate::storage::calculate_file_hash;
+use storage::{calculate_file_hash_with_context, FileStorageData};
 
 type HashDigest = [u8; HASH_LEN];
 type Filesize = u64;
@@ -32,7 +30,7 @@ struct DedupArgs {
   dry_run: bool,
 
   /// File buffer size per file in KiB.
-  #[arg(short, long, default_value = "16")]
+  #[arg(short, long, default_value = "2048")]
   buffer_size: usize,
 
   /// The extension to apply to the hard link before it's renamed to the original filename.
@@ -45,6 +43,10 @@ struct DedupArgs {
   #[arg(short, long, action = ArgAction::SetTrue)]
   not_readonly: bool,
 
+  /// Keep going even if not all files can be read.
+  #[arg(short, long, action = ArgAction::SetTrue)]
+  ignore_scan_errors: bool,
+
   /// Paths where files will be deduplicated.
   #[arg(required = true, value_hint = clap::ValueHint::DirPath)]
   path: Vec<PathBuf>,
@@ -56,7 +58,7 @@ struct DedupArgs {
 //  size: Filesize,
 //}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ScanDirResult {
   Dir(PathBuf),
   File(FileStorageData),
@@ -70,8 +72,8 @@ impl DedupArgs {
   }
 }
 
-async fn scan_dir(dir: PathBuf) -> Result<Vec<ScanDirResult>> {
-  let mut reader = fs::read_dir(dir).await?;
+async fn scan_dir(dir: impl AsRef<Path>) -> Result<Arc<[ScanDirResult]>> {
+  let mut reader = Box::new(fs::read_dir(dir).await?);
   let mut result = vec![];
   while let Some(entry) = reader.next_entry().await? {
     let path = entry.path();
@@ -90,13 +92,27 @@ async fn scan_dir(dir: PathBuf) -> Result<Vec<ScanDirResult>> {
           }
         }
       }
-      let file = FileStorageData::new(&path).await?;
+      let file = FileStorageData::new(path).await?;
       if file.size > 0 {
         result.push(ScanDirResult::File(file));
       }
     }
   }
-  Ok(result)
+  Ok(result.into())
+}
+
+async fn scan_dir_with_context(dir: impl AsRef<Path>) -> Result<Arc<[ScanDirResult]>> {
+  let result = scan_dir(dir.as_ref())
+    .await
+    .with_context(move || format!("Could not scan dir {}", dir.as_ref().display()));
+  match (result, DedupArgs::get().ignore_scan_errors) {
+    (result, false) => result,
+    (Ok(result), true) => Ok(result),
+    (Err(e), true) => {
+      println!("{e}");
+      Ok(Arc::new([]))
+    }
+  }
 }
 
 async fn merge_with_hard_link(
@@ -144,40 +160,63 @@ async fn merge_with_hard_link(
   Ok(())
 }
 
+async fn merge_with_hard_link_with_context(
+  original: impl AsRef<Path>,
+  redundant: impl AsRef<Path>,
+) -> Result<()> {
+  Ok(
+    merge_with_hard_link(original.as_ref(), redundant.as_ref())
+      .await
+      .with_context(move || {
+        format!(
+          "Could not merge hard link {} to {}",
+          redundant.as_ref().display(),
+          original.as_ref().display()
+        )
+      })?,
+  )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
   let args = DedupArgs::get();
 
   enum WorkerResult {
-    ScanResult(Vec<ScanDirResult>),
+    ScanResult(Arc<[ScanDirResult]>),
     NewHashReceived(StorageUid, FileId, (Filesize, HashDigest)),
   }
   let mut worker = JoinSet::<Result<WorkerResult>>::new();
 
   for path in &args.path {
-    worker.spawn(async { Ok(WorkerResult::ScanResult(scan_dir(path.to_owned()).await?)) });
+    worker.spawn(async {
+      Ok(WorkerResult::ScanResult(
+        scan_dir_with_context(path.to_owned()).await?,
+      ))
+    });
   }
 
   #[derive(Debug, Default)]
   struct StorageContent {
     file_sizes: HashMap<Filesize, HashSet<FileId>>,
     hashes: HashMap<(Filesize, HashDigest), HashSet<FileId>>,
-    files: HashMap<FileId, (PathBuf, Vec<PathBuf>)>,
+    files: HashMap<FileId, (Arc<Path>, Vec<Arc<Path>>)>,
   }
   let mut known_files = HashMap::<StorageUid, StorageContent>::new();
   while let Some(found_files) = worker.join_next().await {
     match found_files?? {
       WorkerResult::ScanResult(files) => {
-        for file in files {
+        for file in files.into_iter().map(ToOwned::to_owned) {
           match file {
             ScanDirResult::Dir(path) => {
-              worker.spawn(async { Ok(WorkerResult::ScanResult(scan_dir(path).await?)) });
+              worker.spawn(async move {
+                Ok(WorkerResult::ScanResult(scan_dir_with_context(path).await?))
+              });
             }
             ScanDirResult::File(storage_data) => {
               let storage = known_files.entry(storage_data.storage_uid).or_default();
               match storage.files.entry(storage_data.file_id) {
                 Entry::Occupied(mut entry) => {
-                  entry.get_mut().1.push(storage_data.path);
+                  entry.get_mut().1.push(storage_data.path.clone());
                 }
                 Entry::Vacant(entry) => {
                   entry.insert((storage_data.path.to_owned(), vec![]));
@@ -207,7 +246,7 @@ async fn main() -> Result<()> {
                             first_file_id,
                             (
                               file_size,
-                              calculate_file_hash(first_file_path, file_size).await?,
+                              calculate_file_hash_with_context(first_file_path, file_size).await?,
                             ),
                           ))
                         });
@@ -218,7 +257,11 @@ async fn main() -> Result<()> {
                           storage_data.file_id,
                           (
                             storage_data.size,
-                            calculate_file_hash(storage_data.path, storage_data.size).await?,
+                            calculate_file_hash_with_context(
+                              storage_data.path.clone(),
+                              storage_data.size,
+                            )
+                            .await?,
                           ),
                         ))
                       });
@@ -259,7 +302,7 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>();
       if let Some(original_file) = files.pop() {
         for duplicate in files {
-          merge_with_hard_link(&original_file, duplicate).await?;
+          merge_with_hard_link_with_context(&original_file, duplicate).await?;
           wasted_space += file_size;
         }
       }

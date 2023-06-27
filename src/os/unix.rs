@@ -12,7 +12,7 @@ use tokio::fs;
 impl FileBackend for fs::File {
   type Metadata = Metadata;
 
-  async fn link_metadata(&self) -> Result<Self::Metadata> {
+  async fn link_metadata(self) -> Result<Self::Metadata> {
     Ok(self.metadata().await?)
   }
 }
@@ -21,7 +21,7 @@ impl FileBackend for fs::File {
 impl FileBackend for File {
   type Metadata = Metadata;
 
-  async fn link_metadata(&self) -> Result<Self::Metadata> {
+  async fn link_metadata(self) -> Result<Self::Metadata> {
     Ok(self.metadata()?)
   }
 }
@@ -30,7 +30,7 @@ impl FileBackend for File {
 impl FileBackend for &Path {
   type Metadata = Metadata;
 
-  async fn link_metadata(&self) -> Result<Self::Metadata> {
+  async fn link_metadata(self) -> Result<Self::Metadata> {
     Ok(fs::metadata(self).await?)
   }
 }

@@ -1,8 +1,10 @@
 use std::{
-  io::{Error, ErrorKind, Result},
-  path::{Path, PathBuf},
+  io::{Error, ErrorKind},
+  path::Path,
+  sync::Arc,
 };
 
+use anyhow::{Context, Result};
 use blake3::Hasher;
 use tokio::{fs, io::AsyncReadExt, join};
 
@@ -11,9 +13,9 @@ use crate::{
   DedupArgs, Filesize, HashDigest,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileStorageData {
-  pub path: PathBuf,
+  pub path: Arc<Path>,
   pub size: Filesize,
   pub storage_uid: StorageUid,
   pub file_id: FileId,
@@ -25,12 +27,21 @@ impl FileStorageData {
     let (link_metadata, metadata) = join!(read_link_metadata(&path), fs::metadata(&path));
     let link_metadata = link_metadata?;
     Ok(FileStorageData {
-      path,
+      path: path.into(),
       size: metadata?.len().try_into().unwrap(),
       storage_uid: link_metadata.get_storage_uid(),
       file_id: link_metadata.get_file_id(),
     })
   }
+
+  // pub async fn new_with_context(path: impl AsRef<Path>) -> Result<Self> {
+  // Ok(Self::new(path.as_ref()).await.with_context(move || {
+  // format!(
+  // "Could not reat metadata for file {}",
+  // path.as_ref().display()
+  // )
+  // })?)
+  // }
 }
 
 pub async fn calculate_file_hash(
@@ -43,7 +54,7 @@ pub async fn calculate_file_hash(
     .open(&path)
     .await?;
   let mut read_buf = vec![0; DedupArgs::get().buffer_size * 1024];
-  let mut hash = Hasher::new();
+  let mut hash = Box::new(Hasher::new());
   let mut file_length = 0;
   loop {
     let bytes_read = reader.read(&mut read_buf[..]).await?;
@@ -63,4 +74,15 @@ pub async fn calculate_file_hash(
     ))?;
   }
   Ok(hash.finalize().into())
+}
+
+pub async fn calculate_file_hash_with_context(
+  path: impl AsRef<Path>,
+  expected_size: Filesize,
+) -> Result<HashDigest> {
+  Ok(
+    calculate_file_hash(path.as_ref(), expected_size)
+      .await
+      .with_context(move || format!("Could not hash file {}", path.as_ref().display()))?,
+  )
 }

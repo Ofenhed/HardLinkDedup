@@ -11,11 +11,13 @@ description = "A tool to save space by replacing duplicate files with hard links
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "io-util", "io-std", "fs", "sync", "macros"] }
 blake3 = "1.3"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 async-trait = "^0.1.59"
+thiserror = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "^0.42", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
