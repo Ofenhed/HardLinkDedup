@@ -2,26 +2,26 @@ use super::{FileBackend, FileLinkBackend};
 use async_trait::async_trait;
 use std::{
   fs::Metadata,
-  io::{Result, Error, ErrorKind},
+  io::{Error, ErrorKind, Result},
   os::windows::fs::MetadataExt,
   path::Path,
 };
 use tokio::fs;
 
 pub struct LinkMetadata {
-    storage: u32,
-    file: u64,
+  storage: u32,
+  file: u64,
 }
 
 impl TryFrom<Metadata> for LinkMetadata {
-    type Error = Error;
+  type Error = Error;
 
-    fn try_from(metadata: Metadata) -> Result<LinkMetadata> {
-        let (Some(storage), Some(file)) = (metadata.volume_serial_number(), metadata.file_index()) else {
+  fn try_from(metadata: Metadata) -> Result<LinkMetadata> {
+    let (Some(storage), Some(file)) = (metadata.volume_serial_number(), metadata.file_index()) else {
             return Err(Error::new(ErrorKind::NotFound, "File metadata not found"));
         };
-        Ok(LinkMetadata { storage, file })
-    }
+    Ok(LinkMetadata { storage, file })
+  }
 }
 
 #[async_trait]

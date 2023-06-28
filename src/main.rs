@@ -44,9 +44,13 @@ struct DedupArgs {
   #[arg(short, long, action = ArgAction::SetTrue)]
   not_readonly: bool,
 
-  /// Keep going even if not all files can be read.
-  #[arg(short, long, action = ArgAction::SetTrue)]
+  /// Keep going even if not all file's metadata can be read.
+  #[arg(long, action = ArgAction::SetTrue)]
   ignore_scan_errors: bool,
+
+  /// Keep going even if not all files can be read.
+  #[arg(long, action = ArgAction::SetTrue)]
+  ignore_hash_errors: bool,
 
   /// Paths where files will be deduplicated.
   #[arg(required = true, value_hint = clap::ValueHint::DirPath)]
@@ -110,7 +114,7 @@ async fn scan_dir_with_context(dir: impl AsRef<Path>) -> Result<Arc<[ScanDirResu
     (result, false) => result,
     (Ok(result), true) => Ok(result),
     (Err(e), true) => {
-      println!("{e}");
+      eprintln!("{e}");
       Ok(Arc::new([]))
     }
   }
@@ -184,7 +188,7 @@ async fn main() -> Result<()> {
 
   enum WorkerResult {
     ScanResult(Arc<[ScanDirResult]>),
-    NewHashReceived(StorageUid, FileId, (Filesize, HashDigest)),
+    NewHashReceived(StorageUid, FileId, (Filesize, Option<HashDigest>)),
   }
   let mut worker = JoinSet::<Result<WorkerResult>>::new();
 
@@ -277,15 +281,16 @@ async fn main() -> Result<()> {
           }
         }
       }
-      WorkerResult::NewHashReceived(storage_uid, file_id, digest) => {
+      WorkerResult::NewHashReceived(storage_uid, file_id, (file_size, Some(digest))) => {
         let Entry::Occupied(mut storage) = known_files.entry(storage_uid) else { unreachable!("Always set by this point") };
         storage
           .get_mut()
           .hashes
-          .entry(digest)
+          .entry((file_size, digest))
           .or_default()
           .insert(file_id);
       }
+      WorkerResult::NewHashReceived(_, _, (_, None)) => (),
     }
   }
 

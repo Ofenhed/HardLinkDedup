@@ -79,10 +79,16 @@ pub async fn calculate_file_hash(
 pub async fn calculate_file_hash_with_context(
   path: impl AsRef<Path>,
   expected_size: Filesize,
-) -> Result<HashDigest> {
-  Ok(
-    calculate_file_hash(path.as_ref(), expected_size)
-      .await
-      .with_context(move || format!("Could not hash file {}", path.as_ref().display()))?,
-  )
+) -> Result<Option<HashDigest>> {
+  let result = calculate_file_hash(path.as_ref(), expected_size)
+    .await
+    .with_context(move || format!("Could not hash file {}", path.as_ref().display()));
+  match (result, DedupArgs::get().ignore_hash_errors) {
+    (Ok(hash), _) => Ok(Some(hash)),
+    (Err(err), true) => {
+      eprintln!("{err}");
+      Ok(None)
+    }
+    (Err(err), false) => Err(err),
+  }
 }

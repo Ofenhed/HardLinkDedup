@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use tokio::fs::DirEntry;
 use std::{hash::Hash, io::Result, path::Path};
+use tokio::fs::DirEntry;
 
 #[cfg(unix)]
 mod unix;
