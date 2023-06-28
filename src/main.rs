@@ -52,6 +52,10 @@ struct DedupArgs {
   #[arg(long, action = ArgAction::SetTrue)]
   ignore_hash_errors: bool,
 
+  /// Print debug information about file IDs.
+  #[arg(long, action = ArgAction::SetTrue)]
+  debug: bool,
+
   /// Paths where files will be deduplicated.
   #[arg(required = true, value_hint = clap::ValueHint::DirPath)]
   path: Vec<PathBuf>,
@@ -134,13 +138,12 @@ async fn merge_with_hard_link(
     unreachable!()
   };
 
-  if args.dry_run {
-    println!(
-      "Linking file {} from {}",
-      original.as_ref().display(),
-      redundant.as_ref().display()
-    );
-  } else {
+  println!(
+    "{} ⇐ {}",
+    original.as_ref().display(),
+    redundant.as_ref().display()
+  );
+  if !args.dry_run {
     fs::hard_link(&original, &new_file).await?;
   }
   if !args.dry_run {
@@ -182,6 +185,19 @@ async fn merge_with_hard_link_with_context(
   )
 }
 
+#[derive(Debug)]
+enum FileEntry {
+  Files(Arc<Path>, HashSet<Arc<Path>>),
+  LinkTo(FileId),
+}
+
+#[derive(Debug, Default)]
+struct StorageContent {
+  file_sizes: HashMap<Filesize, Option<FileId>>,
+  hashes: HashMap<(Filesize, HashDigest), FileId>,
+  files: HashMap<FileId, FileEntry>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
   let args = DedupArgs::get();
@@ -200,13 +216,8 @@ async fn main() -> Result<()> {
     });
   }
 
-  #[derive(Debug, Default)]
-  struct StorageContent {
-    file_sizes: HashMap<Filesize, Option<FileId>>,
-    hashes: HashMap<(Filesize, HashDigest), HashSet<FileId>>,
-    files: HashMap<FileId, (Arc<Path>, HashSet<Arc<Path>>)>,
-  }
   let mut known_files = HashMap::<StorageUid, StorageContent>::new();
+  let mut wasted_space = 0;
   while let Some(found_files) = worker.join_next().await {
     match found_files?? {
       WorkerResult::ScanResult(files) => {
@@ -220,35 +231,68 @@ async fn main() -> Result<()> {
             ScanDirResult::File(storage_data) => {
               let storage = known_files.entry(storage_data.storage_uid).or_default();
               match storage.files.entry(storage_data.file_id) {
-                Entry::Occupied(mut entry) => {
-                  entry.get_mut().1.insert(storage_data.path.clone());
+                Entry::Occupied(current_file_entry) => {
+                  let mut id = storage_data.file_id;
+                  let mut current_entry = current_file_entry;
+                  loop {
+                    match current_entry.get_mut() {
+                      FileEntry::LinkTo(ref file_id) if file_id == &storage_data.file_id => {
+                        unreachable!("File links will never loop")
+                      }
+                      FileEntry::LinkTo(ref file_id) => {
+                        id = *file_id;
+                      }
+                      FileEntry::Files(ref target_file, ref mut links) => {
+                        let is_link = id != storage_data.file_id;
+                        if is_link {
+                          merge_with_hard_link_with_context(target_file, &storage_data.path)
+                            .await?;
+                        }
+                        links.insert(storage_data.path);
+                        if is_link {
+                          storage
+                            .files
+                            .insert(storage_data.file_id, FileEntry::LinkTo(id));
+                        }
+                        break;
+                      }
+                    }
+                    let Entry::Occupied(new_entry) = storage.files.entry(id) else {
+                          unreachable!("Files will never point to invalid file id's")
+                      };
+                    current_entry = new_entry;
+                  }
                 }
                 Entry::Vacant(entry) => {
-                  entry.insert((storage_data.path.to_owned(), Default::default()));
+                  entry.insert(FileEntry::Files(
+                    storage_data.path.to_owned(),
+                    Default::default(),
+                  ));
                   match storage.file_sizes.entry(storage_data.size) {
                     Entry::Occupied(mut entry) => {
                       match entry.get_mut() {
                         old_value @ Some(_) => {
                           let first_file_id = old_value.unwrap();
-                          let first_file_path = storage
+                          if let FileEntry::Files(first_file_path, _) = storage
                             .files
                             .get(&first_file_id)
                             .expect("This file id has to exist")
-                            .0
-                            .clone();
-                          let storage_uid = storage_data.storage_uid;
-                          let file_size = storage_data.size;
-                          worker.spawn(async move {
-                            Ok(WorkerResult::NewHashReceived(
-                              storage_uid,
-                              first_file_id,
-                              (
-                                file_size,
-                                calculate_file_hash_with_context(first_file_path, file_size)
-                                  .await?,
-                              ),
-                            ))
-                          });
+                          {
+                            let storage_uid = storage_data.storage_uid;
+                            let file_size = storage_data.size;
+                            let first_file_path = first_file_path.clone();
+                            worker.spawn(async move {
+                              Ok(WorkerResult::NewHashReceived(
+                                storage_uid,
+                                first_file_id,
+                                (
+                                  file_size,
+                                  calculate_file_hash_with_context(first_file_path, file_size)
+                                    .await?,
+                                ),
+                              ))
+                            });
+                          }
                           *old_value = None;
                         }
                         None => (),
@@ -282,37 +326,38 @@ async fn main() -> Result<()> {
         let storage = known_files
           .get_mut(&storage_uid)
           .expect("Always set by this point");
-        storage
-          .hashes
-          .entry((file_size, digest))
-          .or_default()
-          .insert(file_id);
+        match storage.hashes.entry((file_size, digest)) {
+          Entry::Vacant(entry) => {
+            entry.insert(file_id);
+          }
+          Entry::Occupied(hash_entry) => {
+            let original_id = hash_entry.get();
+            let FileEntry::Files(new_file, mut new_links) = storage.files.insert(file_id, FileEntry::LinkTo(*original_id)).expect("Only known file IDs are hashed") else {
+                      unreachable!("Only files are hashed, and only once")
+                  };
+            let FileEntry::Files(ref original_file, ref mut original_links) = storage.files.get_mut(original_id).expect("Only known file IDs are stored as hash targets") else {
+                      unreachable!("Hash targets are never converted to links")
+                  };
+            wasted_space += file_size;
+            new_links.insert(new_file);
+            for new_file in new_links.into_iter() {
+              merge_with_hard_link_with_context(original_file, &new_file).await?;
+              original_links.insert(new_file);
+            }
+          }
+        }
       }
       WorkerResult::NewHashReceived(_, _, (_, None)) => (),
     }
   }
 
-  let mut wasted_space = 0;
-  for mut storage in known_files.into_values() {
-    for ((file_size, _hash), equal_files) in storage.hashes.into_iter().filter(|(_, x)| x.len() > 1)
-    {
-      let mut files = equal_files.into_iter().map(|x| {
-        storage
-          .files
-          .remove(&x)
-          .expect("Different hashes will not match the same file id")
-      });
-      let (original_file, _) = files.next().expect("Always at least one file");
-      let files = files.flat_map(|(first, mut files)| {
-        files.insert(first);
-        files
-      });
-
-      for duplicate in files {
-        merge_with_hard_link_with_context(&original_file, duplicate).await?;
-        wasted_space += file_size;
-      }
-    }
+  if args.debug {
+    let debug = known_files
+      .into_values()
+      .map(|x| x.files)
+      .flatten()
+      .collect::<HashMap<_, _>>();
+    println!("{debug:#?}");
   }
 
   println!(
