@@ -136,9 +136,9 @@ async fn merge_with_hard_link(
 
   if args.dry_run {
     println!(
-      "Linking file {} to {}",
-      redundant.as_ref().display(),
-      original.as_ref().display()
+      "Linking file {} from {}",
+      original.as_ref().display(),
+      redundant.as_ref().display()
     );
   } else {
     fs::hard_link(&original, &new_file).await?;
@@ -202,9 +202,9 @@ async fn main() -> Result<()> {
 
   #[derive(Debug, Default)]
   struct StorageContent {
-    file_sizes: HashMap<Filesize, HashSet<FileId>>,
+    file_sizes: HashMap<Filesize, Option<FileId>>,
     hashes: HashMap<(Filesize, HashDigest), HashSet<FileId>>,
-    files: HashMap<FileId, (Arc<Path>, Vec<Arc<Path>>)>,
+    files: HashMap<FileId, (Arc<Path>, HashSet<Arc<Path>>)>,
   }
   let mut known_files = HashMap::<StorageUid, StorageContent>::new();
   while let Some(found_files) = worker.join_next().await {
@@ -221,40 +221,37 @@ async fn main() -> Result<()> {
               let storage = known_files.entry(storage_data.storage_uid).or_default();
               match storage.files.entry(storage_data.file_id) {
                 Entry::Occupied(mut entry) => {
-                  entry.get_mut().1.push(storage_data.path.clone());
+                  entry.get_mut().1.insert(storage_data.path.clone());
                 }
                 Entry::Vacant(entry) => {
-                  entry.insert((storage_data.path.to_owned(), vec![]));
+                  entry.insert((storage_data.path.to_owned(), Default::default()));
                   match storage.file_sizes.entry(storage_data.size) {
                     Entry::Occupied(mut entry) => {
-                      let other_files = entry.get_mut();
-                      let mut files_iter = other_files.iter();
-                      let first_file =
-                        if let (Some(file), None) = (files_iter.next(), files_iter.next()) {
-                          Some(file.to_owned())
-                        } else {
-                          None
-                        };
-                      other_files.insert(storage_data.file_id);
-                      if let Some(first_file_id) = first_file {
-                        let first_file_path = storage
-                          .files
-                          .get(&first_file_id)
-                          .expect("This file id has to exist")
-                          .0
-                          .clone();
-                        let storage_uid = storage_data.storage_uid;
-                        let file_size = storage_data.size;
-                        worker.spawn(async move {
-                          Ok(WorkerResult::NewHashReceived(
-                            storage_uid,
-                            first_file_id,
-                            (
-                              file_size,
-                              calculate_file_hash_with_context(first_file_path, file_size).await?,
-                            ),
-                          ))
-                        });
+                      match entry.get_mut() {
+                        old_value @ Some(_) => {
+                          let first_file_id = old_value.unwrap();
+                          let first_file_path = storage
+                            .files
+                            .get(&first_file_id)
+                            .expect("This file id has to exist")
+                            .0
+                            .clone();
+                          let storage_uid = storage_data.storage_uid;
+                          let file_size = storage_data.size;
+                          worker.spawn(async move {
+                            Ok(WorkerResult::NewHashReceived(
+                              storage_uid,
+                              first_file_id,
+                              (
+                                file_size,
+                                calculate_file_hash_with_context(first_file_path, file_size)
+                                  .await?,
+                              ),
+                            ))
+                          });
+                          *old_value = None;
+                        }
+                        None => (),
                       }
                       worker.spawn(async move {
                         Ok(WorkerResult::NewHashReceived(
@@ -271,8 +268,8 @@ async fn main() -> Result<()> {
                         ))
                       });
                     }
-                    entry @ Entry::Vacant(..) => {
-                      entry.or_default().insert(storage_data.file_id);
+                    Entry::Vacant(entry) => {
+                      entry.insert(Some(storage_data.file_id));
                     }
                   }
                 }
@@ -282,9 +279,10 @@ async fn main() -> Result<()> {
         }
       }
       WorkerResult::NewHashReceived(storage_uid, file_id, (file_size, Some(digest))) => {
-        let Entry::Occupied(mut storage) = known_files.entry(storage_uid) else { unreachable!("Always set by this point") };
+        let storage = known_files
+          .get_mut(&storage_uid)
+          .expect("Always set by this point");
         storage
-          .get_mut()
           .hashes
           .entry((file_size, digest))
           .or_default()
@@ -294,23 +292,25 @@ async fn main() -> Result<()> {
     }
   }
 
-  let mut wasted_space: Filesize = 0;
-  for storage in known_files.values() {
-    for ((file_size, _hash), duplicates) in storage.hashes.iter().filter(|(_, x)| x.len() > 1) {
-      let mut files = duplicates
-        .iter()
-        .flat_map(|x| {
-          let (first, rest) = storage.files.get(x).expect("File id will exist here");
-          let mut result = rest.to_owned();
-          result.push(first.to_owned());
-          result
-        })
-        .collect::<Vec<_>>();
-      if let Some(original_file) = files.pop() {
-        for duplicate in files {
-          merge_with_hard_link_with_context(&original_file, duplicate).await?;
-          wasted_space += file_size;
-        }
+  let mut wasted_space = 0;
+  for mut storage in known_files.into_values() {
+    for ((file_size, _hash), equal_files) in storage.hashes.into_iter().filter(|(_, x)| x.len() > 1)
+    {
+      let mut files = equal_files.into_iter().map(|x| {
+        storage
+          .files
+          .remove(&x)
+          .expect("Different hashes will not match the same file id")
+      });
+      let (original_file, _) = files.next().expect("Always at least one file");
+      let files = files.flat_map(|(first, mut files)| {
+        files.insert(first);
+        files
+      });
+
+      for duplicate in files {
+        merge_with_hard_link_with_context(&original_file, duplicate).await?;
+        wasted_space += file_size;
       }
     }
   }
