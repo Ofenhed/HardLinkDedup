@@ -18,7 +18,7 @@ impl FileBackend for fs::File {
 }
 
 #[async_trait]
-impl FileBackend for File {
+impl FileBackend for &DirEntry {
   type Metadata = Metadata;
 
   async fn link_metadata(self) -> Result<Self::Metadata> {
@@ -40,11 +40,11 @@ impl FileLinkBackend for Metadata {
 
   type FileId = u64;
 
-  fn get_storage_uid(&self) -> u64 {
+  fn get_storage_uid(&self) -> Self::StorageUid {
     self.dev()
   }
 
-  fn get_file_id(&self) -> u64 {
+  fn get_file_id(&self) -> Self::FileId {
     self.ino()
   }
 }

@@ -1,3 +1,4 @@
+#![cfg_attr(all(windows, not(feature = "stable")), feature(windows_by_handle))]
 use anyhow::{Context, Result};
 use blake3::OUT_LEN as HASH_LEN;
 use clap::{ArgAction, Parser};

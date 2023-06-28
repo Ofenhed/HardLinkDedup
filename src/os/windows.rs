@@ -13,28 +13,11 @@ use windows::Win32::{
 };
 
 #[async_trait]
-impl FileBackend for File {
+impl FileBackend for &fs::DirEntry {
   type Metadata = BY_HANDLE_FILE_INFORMATION;
 
   async fn link_metadata(self) -> Result<Self::Metadata> {
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    let info_ptr: *mut BY_HANDLE_FILE_INFORMATION = &mut info;
-    let handle = HANDLE(self.as_raw_handle() as isize);
-    if unsafe { GetFileInformationByHandle(handle, info_ptr).as_bool() } {
-      Ok(info)
-    } else {
-      return Err(Error::last_os_error())?;
-    }
-  }
-}
-
-#[async_trait]
-impl FileBackend for fs::File {
-  type Metadata = BY_HANDLE_FILE_INFORMATION;
-
-  async fn link_metadata(self) -> Result<Self::Metadata> {
-    let new_file = self.into_std().await;
-    Ok(new_file.link_metadata().await?)
+    Ok(self.path().link_metadata().await?)
   }
 }
 
@@ -44,7 +27,14 @@ impl FileBackend for &Path {
 
   async fn link_metadata(self) -> Result<Self::Metadata> {
     let file = File::open(self)?;
-    Ok(file.link_metadata().await?)
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let info_ptr: *mut BY_HANDLE_FILE_INFORMATION = &mut info;
+    let handle = HANDLE(file.as_raw_handle() as isize);
+    if unsafe { GetFileInformationByHandle(handle, info_ptr).as_bool() } {
+      Ok(info)
+    } else {
+      return Err(Error::last_os_error())?;
+    }
   }
 }
 

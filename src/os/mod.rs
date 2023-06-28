@@ -1,14 +1,23 @@
 use async_trait::async_trait;
-use std::{fs::File, hash::Hash, io::Result, path::Path};
+use tokio::fs::DirEntry;
+use std::{hash::Hash, io::Result, path::Path};
 
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
 #[cfg(windows)]
+#[cfg(feature = "stable")]
 mod windows;
 #[cfg(windows)]
+#[cfg(feature = "stable")]
 pub use self::windows::*;
+#[cfg(windows)]
+#[cfg(not(feature = "stable"))]
+mod windows_unstable;
+#[cfg(windows)]
+#[cfg(not(feature = "stable"))]
+pub use self::windows_unstable::*;
 
 pub trait FileLinkBackend {
   type StorageUid: Eq + Send + Hash;
@@ -46,6 +55,6 @@ pub async fn read_link_metadata<'a>(from: impl AsRef<Path> + 'a) -> Result<Curre
   from.as_ref().link_metadata().await
 }
 
-pub type CurrentFileLinkBackend = <File as FileBackend>::Metadata;
+pub type CurrentFileLinkBackend = <&'static DirEntry as FileBackend>::Metadata;
 pub type StorageUid = <CurrentFileLinkBackend as FileLinkBackend>::StorageUid;
 pub type FileId = <CurrentFileLinkBackend as FileLinkBackend>::FileId;
