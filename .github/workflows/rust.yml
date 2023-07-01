@@ -24,17 +24,13 @@ jobs:
   build-windows:
 
     runs-on: windows-latest
-    
-    strategy:
-      matrix:
-        features: ["--feature stable", ""]
 
     steps:
     - uses: actions/checkout@v3
-    - name: Build
-      run: cargo build --verbose ${matrix.features}
-    #- name: Run tests
-    #  run: cargo test --verbose  ${matrix.features}
+    - name: Build stable
+      run: cargo build --verbose --feature=stable
+    - name: Build nightly
+      run: cargo +nightly build --verbose --no-default-features
     
   fmt:
 
