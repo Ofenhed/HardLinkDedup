@@ -30,9 +30,18 @@ struct DedupArgs {
   #[arg(short, long, action = ArgAction::SetTrue)]
   dry_run: bool,
 
-  /// File buffer size per file in KiB.
+  /// Ignore files smaller than this (in KiB).
+  #[arg(short, long, default_value = "1024")]
+  min_file_size: Filesize,
+
+  /// File buffer size per file (in KiB).
   #[arg(short, long, default_value = "2048")]
   buffer_size: usize,
+
+  /// Max threads allowed to hash files at the same time. This in combination with limiting the
+  /// buffer size can be used to limit memory usage.
+  #[arg(short, long, default_value = "10")]
+  max_hash_threads: usize,
 
   /// The extension to apply to the hard link before it's renamed to the original filename.
   #[arg(short, long, default_value = "hard_link")]
@@ -61,15 +70,9 @@ struct DedupArgs {
   path: Vec<PathBuf>,
 }
 
-//#[derive(Debug)]
-// struct SizedFile {
-//  path: PathBuf,
-//  size: Filesize,
-//}
-
 #[derive(Debug, Clone)]
 enum ScanDirResult {
-  Dir(PathBuf),
+  Dir(Arc<Path>),
   File(FileStorageData),
 }
 
@@ -84,11 +87,14 @@ impl DedupArgs {
 async fn scan_dir(dir: impl AsRef<Path>) -> Result<Arc<[ScanDirResult]>> {
   let mut reader = Box::new(fs::read_dir(dir).await?);
   let mut result = vec![];
+  let args = DedupArgs::get();
   while let Some(entry) = reader.next_entry().await? {
     let path = entry.path();
-    let metadata = fs::metadata(&path).await?;
-    if metadata.is_dir() {
-      result.push(ScanDirResult::Dir(entry.path()));
+    let metadata = fs::symlink_metadata(&path).await?;
+    if metadata.is_symlink() {
+      continue;
+    } else if metadata.is_dir() {
+      result.push(ScanDirResult::Dir(entry.path().into()));
     } else if metadata.is_file() {
       if let Some(ref pattern) = DedupArgs::get().pattern {
         if let Some(file_name) = entry.path().file_name().map(|name| name.to_string_lossy()) {
@@ -102,7 +108,7 @@ async fn scan_dir(dir: impl AsRef<Path>) -> Result<Arc<[ScanDirResult]>> {
         }
       }
       let file = FileStorageData::new(path).await?;
-      if file.size > 0 {
+      if file.size != 0 && file.size >= args.min_file_size * 1024 {
         result.push(ScanDirResult::File(file));
       }
     }
@@ -138,10 +144,11 @@ async fn merge_with_hard_link(
     unreachable!()
   };
 
+  let sign = if args.dry_run { '↫' } else { '⇐' };
   println!(
-    "{} ⇐ {}",
-    original.as_ref().display(),
-    redundant.as_ref().display()
+    "{original} {sign} {redundant}",
+    original = original.as_ref().display(),
+    redundant = redundant.as_ref().display()
   );
   if !args.dry_run {
     fs::hard_link(&original, &new_file).await?;
@@ -187,6 +194,7 @@ async fn merge_with_hard_link_with_context(
 
 #[derive(Debug)]
 enum FileEntry {
+  OriginalFile(Arc<Path>),
   Files(Arc<Path>, HashSet<Arc<Path>>),
   LinkTo(FileId),
 }
@@ -235,6 +243,7 @@ async fn main() -> Result<()> {
                   let mut id = storage_data.file_id;
                   let mut current_entry = current_file_entry;
                   loop {
+                    let make_link = id != storage_data.file_id;
                     match current_entry.get_mut() {
                       FileEntry::LinkTo(ref file_id) if file_id == &storage_data.file_id => {
                         unreachable!("File links will never loop")
@@ -242,19 +251,19 @@ async fn main() -> Result<()> {
                       FileEntry::LinkTo(ref file_id) => {
                         id = *file_id;
                       }
-                      FileEntry::Files(ref target_file, ref mut links) => {
-                        let is_link = id != storage_data.file_id;
-                        if is_link {
+                      FileEntry::OriginalFile(ref target_file) => {
+                        if make_link {
                           merge_with_hard_link_with_context(target_file, &storage_data.path)
                             .await?;
                         }
-                        links.insert(storage_data.path);
-                        if is_link {
-                          storage
-                            .files
-                            .insert(storage_data.file_id, FileEntry::LinkTo(id));
-                        }
                         break;
+                      }
+                      FileEntry::Files(_, ref mut links) if !make_link => {
+                        links.insert(storage_data.path);
+                        break;
+                      }
+                      FileEntry::Files(..) => {
+                        unreachable!("Tried to create link to non-original file");
                       }
                     }
                     let Entry::Occupied(new_entry) = storage.files.entry(id) else {
@@ -329,20 +338,25 @@ async fn main() -> Result<()> {
         match storage.hashes.entry((file_size, digest)) {
           Entry::Vacant(entry) => {
             entry.insert(file_id);
+            let Some(FileEntry::Files(original, _)) = storage.files.remove(&file_id) else {
+                unreachable!("Got vacant hash of invalid file id");
+            };
+            storage
+              .files
+              .insert(file_id, FileEntry::OriginalFile(original));
           }
           Entry::Occupied(hash_entry) => {
             let original_id = hash_entry.get();
             let FileEntry::Files(new_file, mut new_links) = storage.files.insert(file_id, FileEntry::LinkTo(*original_id)).expect("Only known file IDs are hashed") else {
                       unreachable!("Only files are hashed, and only once")
                   };
-            let FileEntry::Files(ref original_file, ref mut original_links) = storage.files.get_mut(original_id).expect("Only known file IDs are stored as hash targets") else {
+            let FileEntry::OriginalFile(ref original_file) = storage.files.get_mut(original_id).expect("Only known file IDs are stored as hash targets") else {
                       unreachable!("Hash targets are never converted to links")
                   };
             wasted_space += file_size;
             new_links.insert(new_file);
             for new_file in new_links.into_iter() {
               merge_with_hard_link_with_context(original_file, &new_file).await?;
-              original_links.insert(new_file);
             }
           }
         }
