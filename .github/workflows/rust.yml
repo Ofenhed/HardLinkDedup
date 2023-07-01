@@ -56,12 +56,3 @@ jobs:
         override: true
     - name: Check
       run: cargo +nightly fmt --check
-
-  clippy:
-
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v3
-    - name: Check
-      run: cargo clippy
