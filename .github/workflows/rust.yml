@@ -52,7 +52,7 @@ jobs:
     - uses: actions-rs/toolchain@v1
       with:
         toolchain: nightly
-        components: fmt
+        components: rustfmt
         override: true
     - name: Check
       run: cargo +nightly fmt --check
