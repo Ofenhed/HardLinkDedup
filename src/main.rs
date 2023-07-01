@@ -154,18 +154,24 @@ async fn merge_with_hard_link(
     fs::hard_link(&original, &new_file).await?;
   }
   if !args.dry_run {
+    let mut redundant_permissions = fs::metadata(&redundant).await?.permissions();
+    if redundant_permissions.readonly() {
+      redundant_permissions.set_readonly(false);
+      fs::set_permissions(&redundant, redundant_permissions).await?;
+    }
     if let Err(e) = fs::rename(&new_file, &redundant).await {
       fs::remove_file(new_file).await?;
       return Err(e)?;
     }
   }
   if !args.not_readonly {
+    let metadata_original = fs::metadata(&original).await?;
     if args.dry_run {
-      if !fs::metadata(&original).await?.permissions().readonly() {
+      if !metadata_original.permissions().readonly() {
         println!("Applying readonly to {} ", original.as_ref().display());
       }
     } else {
-      let mut permissions = fs::metadata(&original).await?.permissions();
+      let mut permissions = metadata_original.permissions();
       if !permissions.readonly() {
         permissions.set_readonly(true);
         fs::set_permissions(&original, permissions).await?;
