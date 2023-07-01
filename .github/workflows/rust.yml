@@ -39,4 +39,4 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Check
-      run: cargo fmt --check
+      run: cargo +nightly fmt --check
