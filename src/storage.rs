@@ -56,7 +56,7 @@ pub async fn calculate_file_hash(
   path: impl AsRef<Path>,
   expected_size: Filesize,
 ) -> Result<HashDigest> {
-  let lock = get_file_hash_lock().acquire();
+  let lock = get_file_hash_lock().acquire().await?;
   let hash = {
     let mut hash = Box::new(Hasher::new());
     let mut file_length = 0;
