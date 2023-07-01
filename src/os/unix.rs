@@ -1,11 +1,6 @@
 use super::{FileBackend, FileLinkBackend};
 use async_trait::async_trait;
-use std::{
-  fs::{File, Metadata},
-  io::Result,
-  os::unix::fs::MetadataExt,
-  path::PathBuf,
-};
+use std::{fs::Metadata, io::Result, os::unix::fs::MetadataExt, path::Path};
 use tokio::fs;
 
 #[async_trait]
@@ -18,11 +13,11 @@ impl FileBackend for fs::File {
 }
 
 #[async_trait]
-impl FileBackend for &DirEntry {
+impl FileBackend for &fs::DirEntry {
   type Metadata = Metadata;
 
   async fn link_metadata(self) -> Result<Self::Metadata> {
-    Ok(self.metadata()?)
+    Ok(self.metadata().await?)
   }
 }
 
