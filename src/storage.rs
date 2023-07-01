@@ -27,6 +27,7 @@ impl FileStorageData {
     let path = path.as_ref().to_owned();
     let (link_metadata, metadata) = join!(read_link_metadata(&path), fs::metadata(&path));
     let link_metadata = link_metadata?;
+    #[allow(clippy::useless_conversion)]
     Ok(FileStorageData {
       path: path.into(),
       size: metadata?.len().try_into().unwrap(),

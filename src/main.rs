@@ -80,7 +80,7 @@ static ARGS: OnceLock<DedupArgs> = OnceLock::new();
 
 impl DedupArgs {
   pub fn get() -> &'static Self {
-    ARGS.get_or_init(|| DedupArgs::parse())
+    ARGS.get_or_init(DedupArgs::parse)
   }
 }
 
@@ -179,17 +179,15 @@ async fn merge_with_hard_link_with_context(
   original: impl AsRef<Path>,
   redundant: impl AsRef<Path>,
 ) -> Result<()> {
-  Ok(
-    merge_with_hard_link(original.as_ref(), redundant.as_ref())
-      .await
-      .with_context(move || {
-        format!(
-          "Could not merge hard link {} to {}",
-          redundant.as_ref().display(),
-          original.as_ref().display()
-        )
-      })?,
-  )
+  merge_with_hard_link(original.as_ref(), redundant.as_ref())
+    .await
+    .with_context(move || {
+      format!(
+        "Could not merge hard link {} to {}",
+        redundant.as_ref().display(),
+        original.as_ref().display()
+      )
+    })
 }
 
 #[derive(Debug)]
@@ -229,7 +227,7 @@ async fn main() -> Result<()> {
   while let Some(found_files) = worker.join_next().await {
     match found_files?? {
       WorkerResult::ScanResult(files) => {
-        for file in files.into_iter().map(ToOwned::to_owned) {
+        for file in files.iter().map(ToOwned::to_owned) {
           match file {
             ScanDirResult::Dir(path) => {
               worker.spawn(async move {
@@ -368,8 +366,7 @@ async fn main() -> Result<()> {
   if args.debug {
     let debug = known_files
       .into_values()
-      .map(|x| x.files)
-      .flatten()
+      .flat_map(|x| x.files)
       .collect::<HashMap<_, _>>();
     println!("{debug:#?}");
   }
