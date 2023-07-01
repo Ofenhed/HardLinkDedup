@@ -108,7 +108,10 @@ async fn scan_dir(dir: impl AsRef<Path>) -> Result<Arc<[ScanDirResult]>> {
         }
       }
       let file = FileStorageData::new(path).await?;
-      if file.size != 0 && file.size >= args.min_file_size * 1024 {
+      if file.path.extension() != Some(&args.temporary_extension)
+        && file.size != 0
+        && file.size >= args.min_file_size * 1024
+      {
         result.push(ScanDirResult::File(file));
       }
     }
