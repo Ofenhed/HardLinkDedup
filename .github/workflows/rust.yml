@@ -36,7 +36,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - uses: actions-rs/components-nightly@v1
+    - uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+        override: true
     - name: Build nightly
       run: cargo +nightly build --verbose --no-default-features
     
@@ -46,9 +49,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - uses: actions-rs/components-nightly@v1
+    - uses: actions-rs/toolchain@v1
       with:
-        component: fmt
+        toolchain: nightly
+        components: fmt
+        override: true
     - name: Check
       run: cargo +nightly fmt --check
 
