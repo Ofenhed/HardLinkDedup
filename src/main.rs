@@ -285,8 +285,8 @@ async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
                       }
                     }
                     let Entry::Occupied(new_entry) = storage.files.entry(id) else {
-                          unreachable!("Files will never point to invalid file id's")
-                      };
+                      unreachable!("Files will never point to invalid file id's")
+                    };
                     current_entry = new_entry;
                   }
                 }
@@ -359,7 +359,7 @@ async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
           Entry::Vacant(entry) => {
             entry.insert(file_id);
             let Some(FileEntry::Files(original, _)) = storage.files.remove(&file_id) else {
-                unreachable!("Got vacant hash of invalid file id");
+              unreachable!("Got vacant hash of invalid file id");
             };
             storage
               .files
@@ -367,12 +367,20 @@ async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
           }
           Entry::Occupied(hash_entry) => {
             let original_id = hash_entry.get();
-            let FileEntry::Files(new_file, mut new_links) = storage.files.insert(file_id, FileEntry::LinkTo(*original_id)).expect("Only known file IDs are hashed") else {
-                      unreachable!("Only files are hashed, and only once")
-                  };
-            let FileEntry::OriginalFile(ref original_file) = storage.files.get_mut(original_id).expect("Only known file IDs are stored as hash targets") else {
-                      unreachable!("Hash targets are never converted to links")
-                  };
+            let FileEntry::Files(new_file, mut new_links) = storage
+              .files
+              .insert(file_id, FileEntry::LinkTo(*original_id))
+              .expect("Only known file IDs are hashed")
+            else {
+              unreachable!("Only files are hashed, and only once")
+            };
+            let FileEntry::OriginalFile(ref original_file) = storage
+              .files
+              .get_mut(original_id)
+              .expect("Only known file IDs are stored as hash targets")
+            else {
+              unreachable!("Hash targets are never converted to links")
+            };
             stats.saved_storage += file_size;
             new_links.insert(new_file);
             for new_file in new_links.into_iter() {
