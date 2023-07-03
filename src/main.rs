@@ -9,7 +9,7 @@ use std::{
   path::{Path, PathBuf},
   sync::{Arc, OnceLock},
 };
-use tokio::{fs, task::JoinSet};
+use tokio::{fs, sync::Mutex, task::JoinSet};
 
 mod os;
 mod storage;
@@ -213,8 +213,13 @@ struct StorageContent {
   files: HashMap<FileId, FileEntry>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Default)]
+struct Stats {
+  saved_storage: Filesize,
+  files_hashed: usize,
+}
+
+async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
   let args = DedupArgs::get();
 
   enum WorkerResult {
@@ -222,6 +227,7 @@ async fn main() -> Result<()> {
     NewHashReceived(StorageUid, FileId, (Filesize, Option<HashDigest>)),
   }
   let mut worker = JoinSet::<Result<WorkerResult>>::new();
+  let mut stats = stats.as_ref().lock().await;
 
   for path in &args.path {
     worker.spawn(async {
@@ -232,7 +238,6 @@ async fn main() -> Result<()> {
   }
 
   let mut known_files = HashMap::<StorageUid, StorageContent>::new();
-  let mut wasted_space = 0;
   while let Some(found_files) = worker.join_next().await {
     match found_files?? {
       WorkerResult::ScanResult(files) => {
@@ -339,6 +344,7 @@ async fn main() -> Result<()> {
         }
       }
       WorkerResult::NewHashReceived(storage_uid, file_id, (file_size, Some(digest))) => {
+        stats.files_hashed += 1;
         let storage = known_files
           .get_mut(&storage_uid)
           .expect("Always set by this point");
@@ -360,7 +366,7 @@ async fn main() -> Result<()> {
             let FileEntry::OriginalFile(ref original_file) = storage.files.get_mut(original_id).expect("Only known file IDs are stored as hash targets") else {
                       unreachable!("Hash targets are never converted to links")
                   };
-            wasted_space += file_size;
+            stats.saved_storage += file_size;
             new_links.insert(new_file);
             for new_file in new_links.into_iter() {
               merge_with_hard_link_with_context(original_file, &new_file).await?;
@@ -380,10 +386,32 @@ async fn main() -> Result<()> {
     println!("{debug:#?}");
   }
 
+  Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+  let args = DedupArgs::get();
+  let stats: Arc<Mutex<Stats>> = Default::default();
+  let handle = tokio::task::spawn(run(stats.clone()));
+  let abort = handle.abort_handle();
+  tokio::task::spawn(async move {
+    if tokio::signal::ctrl_c().await.is_ok() {
+      abort.abort();
+    }
+  });
+  let result = match handle.await {
+    Ok(result) => result,
+    Err(e) if e.is_cancelled() => Ok(()),
+    Err(e) => Err(e.into()),
+  };
+  let stats = stats.as_ref().lock().await;
+  println!();
+  println!("{} files hashed", stats.files_hashed,);
   println!(
     "A total of {} MiB {} saved",
-    wasted_space / (1024 * 1024),
+    stats.saved_storage / (1024 * 1024),
     if args.dry_run { "can be" } else { "was" }
   );
-  Ok(())
+  result
 }
