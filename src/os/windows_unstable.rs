@@ -17,9 +17,10 @@ impl TryFrom<Metadata> for LinkMetadata {
   type Error = Error;
 
   fn try_from(metadata: Metadata) -> Result<LinkMetadata> {
-    let (Some(storage), Some(file)) = (metadata.volume_serial_number(), metadata.file_index()) else {
-            return Err(Error::new(ErrorKind::NotFound, "File metadata not found"));
-        };
+    let (Some(storage), Some(file)) = (metadata.volume_serial_number(), metadata.file_index())
+    else {
+      return Err(Error::new(ErrorKind::NotFound, "File metadata not found"));
+    };
     Ok(LinkMetadata { storage, file })
   }
 }
