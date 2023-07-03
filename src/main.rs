@@ -217,6 +217,9 @@ struct StorageContent {
 struct Stats {
   saved_storage: Filesize,
   files_hashed: usize,
+  bytes_hashed: Filesize,
+  files_processed: usize,
+  dirs_scanned: usize,
 }
 
 async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
@@ -230,6 +233,7 @@ async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
   let mut stats = stats.as_ref().lock().await;
 
   for path in &args.path {
+    stats.dirs_scanned += 1;
     worker.spawn(async {
       Ok(WorkerResult::ScanResult(
         scan_dir_with_context(path.to_owned()).await?,
@@ -244,11 +248,13 @@ async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
         for file in files.iter().map(ToOwned::to_owned) {
           match file {
             ScanDirResult::Dir(path) => {
+              stats.dirs_scanned += 1;
               worker.spawn(async move {
                 Ok(WorkerResult::ScanResult(scan_dir_with_context(path).await?))
               });
             }
             ScanDirResult::File(storage_data) => {
+              stats.files_processed += 1;
               let storage = known_files.entry(storage_data.storage_uid).or_default();
               match storage.files.entry(storage_data.file_id) {
                 Entry::Occupied(current_file_entry) => {
@@ -345,6 +351,7 @@ async fn run(stats: Arc<Mutex<Stats>>) -> Result<()> {
       }
       WorkerResult::NewHashReceived(storage_uid, file_id, (file_size, Some(digest))) => {
         stats.files_hashed += 1;
+        stats.bytes_hashed += file_size;
         let storage = known_files
           .get_mut(&storage_uid)
           .expect("Always set by this point");
@@ -407,7 +414,15 @@ async fn main() -> Result<()> {
   };
   let stats = stats.as_ref().lock().await;
   println!();
-  println!("{} files hashed", stats.files_hashed,);
+  println!(
+    "{} dirs and {} files processed",
+    stats.dirs_scanned, stats.files_processed
+  );
+  println!(
+    "{} files hashed ({} MiB)",
+    stats.files_hashed,
+    stats.bytes_hashed / (1024 * 1024)
+  );
   println!(
     "A total of {} MiB {} saved",
     stats.saved_storage / (1024 * 1024),
