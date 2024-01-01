@@ -31,7 +31,7 @@ struct DedupArgs {
   dry_run: bool,
 
   /// Ignore files smaller than this (in KiB).
-  #[arg(short, long, default_value = "1024")]
+  #[arg(long, default_value = "1024")]
   min_file_size: Filesize,
 
   /// File buffer size per file (in KiB).
